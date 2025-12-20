@@ -75,10 +75,35 @@ def _split_sentences(text: str) -> List[str]:
 
 def _score_question(sentence: str) -> float:
     """
-    Score how likely a sentence is a question (0.0 to 1.0)
+    Score how likely a sentence is a COMPLETE question (0.0 to 1.0)
     """
-    sentence_lower = sentence.lower()
+    sentence_lower = sentence.lower().strip()
+    words = sentence_lower.split()
     score = 0.0
+
+    # Reject too short (likely incomplete)
+    if len(words) < 5:
+        return 0.0
+
+    # Reject fragments that are clearly incomplete
+    incomplete_endings = ['the', 'a', 'an', 'to', 'of', 'for', 'with', 'about', 'how', 'what', 'is', 'are', 'does', 'do', 'can', 'could', 'would']
+    last_word = words[-1].rstrip('?.,!') if words else ""
+    if last_word in incomplete_endings:
+        return 0.0
+
+    # Reject if it's just "can you tell me" type fragments
+    fragment_patterns = [
+        r'^can you tell me\??$',
+        r'^tell me\??$',
+        r'^can you explain\??$',
+        r'^what about\??$',
+        r'^how about\??$',
+        r'^okay,?\s*(can you|tell me)?\??$',
+        r'^so,?\s*(tell me|can you)?\??$',
+    ]
+    for pattern in fragment_patterns:
+        if re.match(pattern, sentence_lower):
+            return 0.0
 
     # Check for question mark (strong signal)
     if '?' in sentence:
@@ -90,15 +115,21 @@ def _score_question(sentence: str) -> float:
             score += 0.3
             break
 
-    # Check for question keywords
+    # Check for question keywords (business/technical topics)
     keyword_count = sum(1 for kw in QUESTION_KEYWORDS if kw in sentence_lower)
     if keyword_count > 0:
-        score += min(0.2, keyword_count * 0.05)
+        score += min(0.3, keyword_count * 0.1)
 
     # Check for question word at start
-    first_word = sentence_lower.split()[0] if sentence_lower.split() else ""
-    if first_word in ['what', 'how', 'why', 'when', 'where', 'who', 'which', 'can', 'could', 'would', 'does', 'do', 'is', 'are']:
+    first_word = words[0] if words else ""
+    if first_word in ['what', 'how', 'why', 'when', 'where', 'who', 'which']:
         score += 0.2
+    elif first_word in ['can', 'could', 'would', 'does', 'do', 'is', 'are']:
+        score += 0.1
+
+    # Bonus for complete-sounding questions (has subject and verb)
+    if len(words) >= 7:
+        score += 0.1
 
     return min(1.0, score)
 

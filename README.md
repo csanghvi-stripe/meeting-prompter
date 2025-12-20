@@ -110,10 +110,45 @@ Configure your Mac's audio:
 
 ## Usage
 
-### Test with Audio File
+### Testing the Agent
+
+There are two ways to test the agent before using it in a live meeting:
+
+#### Option 1: Create Test Audio with macOS `say` Command
+
+Generate a test audio file from text, then run the agent:
 
 ```bash
-./venv/bin/python3 coach.py --test audio.wav
+# Step 1: Create AIFF file with text-to-speech
+say -o test.aiff "How does Liquid AI compare to OpenAI?"
+
+# Step 2: Convert to WAV format (16kHz, 16-bit - required by LFM2-Audio)
+afconvert test.aiff -o test.wav -d LEI16@16000 -f WAVE
+
+# Step 3: Run the agent
+./venv/bin/python3 coach.py --test test.wav
+```
+
+Or as a one-liner:
+```bash
+say -o q.aiff "What makes your product different?" && afconvert q.aiff -o q.wav -d LEI16@16000 -f WAVE && ./venv/bin/python3 coach.py --test q.wav
+```
+
+#### Option 2: Use an Existing Audio File
+
+If you have a WAV file from a recorded meeting or call:
+
+```bash
+./venv/bin/python3 coach.py --test your_audio.wav
+```
+
+**Note:** Audio files must be WAV format. To convert other formats:
+```bash
+# Convert MP3 to WAV (requires ffmpeg)
+ffmpeg -i audio.mp3 -ar 16000 -ac 1 audio.wav
+
+# Convert M4A to WAV (using macOS afconvert)
+afconvert audio.m4a -o audio.wav -d LEI16@16000 -f WAVE
 ```
 
 ### List Audio Devices
@@ -122,25 +157,80 @@ Configure your Mac's audio:
 ./venv/bin/python3 coach.py --list-devices
 ```
 
-### Start Live Capture
+### Live Meeting Mode (Zoom, Meet, Teams, etc.)
+
+To capture audio from video calls, you need to route meeting audio through BlackHole:
+
+#### Step 1: Install BlackHole (one-time setup)
 
 ```bash
-# Default: capture from BlackHole
-./venv/bin/python3 coach.py
-
-# Or specify a device
-./venv/bin/python3 coach.py --device "MacBook Pro Microphone"
+brew install blackhole-2ch
 ```
 
-### During a Meeting
+#### Step 2: Create Multi-Output Device (one-time setup)
 
-1. Start a video call (Zoom, Meet, Teams, etc.)
-2. Run the agent: `./venv/bin/python3 coach.py`
-3. Watch for:
-   - Real-time transcription
-   - Vibe indicators (Excited/Frustrated/Uncertain/Confident/Engaged)
-   - Suggested answers when questions are detected
-4. Press `Ctrl+C` to stop and see meeting summary
+This lets you hear meeting audio AND send it to the agent:
+
+1. Open **Audio MIDI Setup** (Applications → Utilities → Audio MIDI Setup)
+2. Click the **+** button at bottom-left → **Create Multi-Output Device**
+3. Check both:
+   - ✅ **BlackHole 2ch**
+   - ✅ **MacBook Pro Speakers** (or your headphones)
+4. Right-click the Multi-Output Device → **Use This Device For Sound Output** (optional)
+
+#### Step 3: Configure Zoom/Meet Audio
+
+**Option A: Per-app (recommended)**
+- In Zoom: Click `^` next to mic → **Speaker** → Select **"Multi-Output Device"**
+- In Google Meet: Settings → Audio → Speaker → **"Multi-Output Device"**
+
+**Option B: System-wide**
+- System Settings → Sound → Output → Select **"Multi-Output Device"**
+
+#### Step 4: Start the Agent
+
+```bash
+source venv/bin/activate
+python coach.py
+```
+
+You should see:
+```
+[STATUS] Listening to BlackHole 2ch...
+[STATUS] Output file: /path/to/output/live_analytics.txt
+```
+
+#### Step 5: Join Your Meeting
+
+Join your Zoom/Meet/Teams call. As people speak, you'll see:
+- Real-time transcription
+- Vibe indicators (Excited/Frustrated/Uncertain/Confident/Engaged)
+- Suggested answers when questions are detected
+
+Press `Ctrl+C` to stop and see the meeting summary.
+
+#### Troubleshooting: No Audio Detected
+
+If you're not seeing transcriptions, verify audio is flowing:
+
+```bash
+# Test if BlackHole is receiving audio
+python -c "
+import sounddevice as sd
+import numpy as np
+print('Recording 3 seconds... (play audio in your meeting)')
+rec = sd.rec(int(3*16000), samplerate=16000, channels=1, device='BlackHole 2ch')
+sd.wait()
+level = np.max(np.abs(rec))
+print(f'Audio level: {level:.4f}')
+print('✅ Audio detected!' if level > 0.001 else '❌ No audio - check Multi-Output Device setup')
+"
+```
+
+Common fixes:
+- Ensure Zoom/Meet speaker is set to **"Multi-Output Device"**
+- Make sure BlackHole 2ch is checked in the Multi-Output Device settings
+- Restart the meeting app after changing audio settings
 
 ## Project Structure
 

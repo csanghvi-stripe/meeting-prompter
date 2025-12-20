@@ -7,17 +7,18 @@ from llama_cpp import Llama
 class AnswerGenerator:
     """Generates answers to questions using LFM2 text model and RAG context"""
 
-    def __init__(self, model_path: Path, n_ctx: int = 2048):
+    def __init__(self, model_path: Path, n_ctx: int = 1024):
         """
         Initialize the answer generator.
 
         Args:
             model_path: Path to LFM2-1.2B GGUF model
-            n_ctx: Context window size
+            n_ctx: Context window size (smaller = more stable)
         """
         self.model_path = model_path
         self.llm: Optional[Llama] = None
         self.n_ctx = n_ctx
+        self._call_count = 0
 
     def load(self):
         """Load the model (lazy loading for memory efficiency)"""
@@ -29,11 +30,24 @@ class AnswerGenerator:
                 verbose=False,
             )
 
+    def _reset_if_needed(self):
+        """Reset model state periodically to prevent KV cache corruption"""
+        self._call_count += 1
+        # Reset every 10 calls to prevent state corruption
+        if self._call_count >= 10 and self.llm is not None:
+            try:
+                self.llm.reset()
+            except:
+                # If reset fails, reload the model
+                self.llm = None
+                self.load()
+            self._call_count = 0
+
     def generate_answer(
         self,
         question: str,
         context: str,
-        max_tokens: int = 150,
+        max_tokens: int = 100,
     ) -> str:
         """
         Generate an answer to a question based on RAG context.
@@ -47,33 +61,49 @@ class AnswerGenerator:
             Generated answer string
         """
         self.load()
+        self._reset_if_needed()
 
         # Build prompt for Q&A
         prompt = self._build_prompt(question, context)
 
-        try:
-            response = self.llm(
-                prompt,
-                max_tokens=max_tokens,
-                stop=["Question:", "\n\n\n", "---"],
-                temperature=0.3,  # Lower for more factual responses
-            )
-            answer = response['choices'][0]['text'].strip()
-            return self._clean_answer(answer)
-        except Exception as e:
-            return f"[Unable to generate answer: {e}]"
+        # Retry logic for llama_decode errors
+        for attempt in range(2):
+            try:
+                response = self.llm(
+                    prompt,
+                    max_tokens=max_tokens,
+                    stop=["Question:", "\n\n\n", "---"],
+                    temperature=0.3,  # Lower for more factual responses
+                )
+                answer = response['choices'][0]['text'].strip()
+                return self._clean_answer(answer)
+            except Exception as e:
+                if attempt == 0 and "llama_decode" in str(e):
+                    # Reset and retry once
+                    try:
+                        self.llm.reset()
+                    except:
+                        self.llm = None
+                        self.load()
+                    continue
+                return f"[Unable to generate answer: {e}]"
+
+        return "[Unable to generate answer after retry]"
 
     def _build_prompt(self, question: str, context: str) -> str:
         """Build the prompt for answer generation"""
-        # Truncate context if too long
-        max_context_chars = 1500
+        # Truncate context to fit in smaller context window
+        max_context_chars = 600
         if len(context) > max_context_chars:
             context = context[:max_context_chars] + "..."
 
-        prompt = f"""You are a helpful sales engineer for Liquid AI. Answer the customer's question using the provided context. Be concise, accurate, and helpful. If the context doesn't contain enough information, say so.
+        # Truncate question if too long
+        if len(question) > 200:
+            question = question[:200] + "..."
 
-Context from Liquid AI documentation:
-{context}
+        prompt = f"""Answer the question using the context. Be concise.
+
+Context: {context}
 
 Question: {question}
 

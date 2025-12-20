@@ -33,6 +33,7 @@ plan.md
 # Test audio files
 *.wav
 *.mp3
+*.aiff
 
 # IDE
 .idea/

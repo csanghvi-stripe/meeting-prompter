@@ -69,63 +69,241 @@ class MeetingIntelligence:
         self.confidence_sum = 0.0
         self.last_answer = ""  # Cache last generated answer
 
+        # Question buffering - accumulate until pause detected
+        self.question_chunks = []  # Accumulate multiple chunks
+        self.silence_count = 0  # Track consecutive short/noise chunks
+        self.is_buffering_question = False
+        self.buffer_start_time = 0
+
         # Ensure output directory exists
         OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
 
+    def _is_noise(self, text: str) -> bool:
+        """Check if text is just filler words/noise that should be ignored"""
+        text_lower = text.lower().strip()
+        words = text_lower.split()
+
+        # Too short to be meaningful
+        if len(words) < 3:
+            return True
+
+        # Common filler phrases to ignore
+        noise_phrases = [
+            "yeah", "yeah yeah", "yeah yeah yeah",
+            "um", "uh", "uh huh", "um um",
+            "okay", "ok", "oh", "oh well",
+            "i don't know", "i dunno",
+            "and then", "to that one", "so",
+            "a", "the", "is it", "it is",
+            "hmm", "hm", "ah", "eh",
+            "right", "right right",
+            "sure", "sure sure",
+            "well", "well well",
+            "you know", "like",
+        ]
+
+        # Check if entire text matches a noise phrase
+        text_clean = text_lower.rstrip('.,?!')
+        if text_clean in noise_phrases:
+            return True
+
+        # Check if all words are filler words
+        filler_words = {'yeah', 'um', 'uh', 'okay', 'ok', 'oh', 'well', 'so', 'like',
+                        'right', 'hmm', 'hm', 'ah', 'eh', 'a', 'the', 'and', 'then',
+                        'i', "don't", 'know', 'just', 'to', 'that', 'one', 'it', 'is'}
+        meaningful_words = [w for w in words if w.rstrip('.,?!') not in filler_words]
+
+        # If less than 2 meaningful words, it's noise
+        if len(meaningful_words) < 2:
+            return True
+
+        return False
+
+    def _looks_like_question_start(self, text: str) -> bool:
+        """Check if text looks like the start of a question"""
+        text_lower = text.lower().strip()
+        words = text_lower.split()
+        if not words:
+            return False
+
+        # Question starters
+        question_starters = ['what', 'how', 'why', 'when', 'where', 'who', 'which',
+                            'can', 'could', 'would', 'will', 'does', 'do', 'is', 'are',
+                            'tell', 'explain', 'describe', 'help']
+
+        first_word = words[0].rstrip('.,?!')
+        return first_word in question_starters
+
+    def _has_question_ending(self, text: str) -> bool:
+        """Check if text has a clear question ending"""
+        text = text.strip()
+        # Ends with question mark
+        if text.endswith('?'):
+            return True
+        # Long enough sentence ending with period (likely complete thought)
+        if text.endswith('.') and len(text.split()) >= 8:
+            return True
+        return False
+
     def process_chunk(self, audio_path: Path):
-        """Process a single audio chunk"""
+        """Process a single audio chunk with intelligent question buffering"""
         try:
+            import time as time_module
+
             # 1. Transcribe audio
+            t_start = time_module.time()
             text = self.lfm2.transcribe(audio_path)
+            t_transcribe = time_module.time() - t_start
 
             if not text or text.startswith("["):
-                return  # Skip errors/empty
+                self.silence_count += 1
+                self._check_and_process_buffer()
+                return
 
+            # Check if this is noise/filler
+            is_noise = self._is_noise(text)
+
+            if is_noise:
+                self.silence_count += 1
+                self._check_and_process_buffer()
+                print(f"\r🎧 Listening...                                        ", end="", flush=True)
+                return
+
+            # Meaningful content - reset silence counter
+            self.silence_count = 0
+
+            # Add to transcript buffer
             self.transcript_buffer.append(text)
             self.chunk_count += 1
 
-            # Use rolling window of last 10 chunks for context
-            full_context = " ".join(self.transcript_buffer[-10:])
+            # Check if we should start buffering a question
+            if not self.is_buffering_question:
+                if self._looks_like_question_start(text):
+                    # Start buffering
+                    self.is_buffering_question = True
+                    self.question_chunks = [text]
+                    self.buffer_start_time = time_module.time()
+                    print(f"\r🎤 Question: \"{text}\"", end="", flush=True)
 
-            # 2. Analyze vibe
-            vibe = analyze_vibe(full_context)
-            self.vibe_counts[vibe["dominant"]] += 1
+                    # If it already looks complete, process it
+                    if self._has_question_ending(text) and len(text.split()) >= 6:
+                        self._process_question_buffer()
+                    return
+                else:
+                    # Not a question, just show what we heard
+                    print(f"\r🎧 \"{text[:60]}\"" + ("..." if len(text) > 60 else ""), end="", flush=True)
 
-            # 3. Query RAG for context
-            rag_context, confidence = self.rag.query(full_context)
-            self.confidence_sum += confidence
+                    # Log to file
+                    timestamp = time.strftime('%H:%M:%S')
+                    with open(OUTPUT_FILE, "a") as f:
+                        f.write(f"[{timestamp}] {text}\n")
+                    return
 
-            # 4. Detect questions and generate answers
-            question_result = get_primary_question(text)
-            answer = ""
-            if question_result:
-                question_text, question_score = question_result
-                if question_score > 0.4:  # High confidence question
-                    answer = self.answer_gen.generate_answer(question_text, rag_context)
-                    self.last_answer = answer
+            # We're buffering a question - add this chunk
+            self.question_chunks.append(text)
+            full_question = " ".join(self.question_chunks)
+            print(f"\r🎤 Question: \"{full_question[:70]}\"" + ("..." if len(full_question) > 70 else ""), end="", flush=True)
 
-            # 5. Update display
-            display_update(
-                transcript=text,
-                vibe=vibe["dominant"],
-                vibe_emoji=vibe["emoji"],
-                confidence=confidence,
-                context_preview=self.rag.get_context_preview(rag_context),
-            )
-
-            # 6. Show answer if question was detected
-            if answer:
-                print(f"\n\n💡 SUGGESTED ANSWER:\n{answer}\n")
-
-            # 7. Log to file
-            timestamp = time.strftime('%H:%M:%S')
-            with open(OUTPUT_FILE, "a") as f:
-                f.write(f"[{timestamp}] {text} | Vibe: {vibe['dominant']} | Conf: {confidence:.0%}\n")
-                if answer:
-                    f.write(f"[{timestamp}] 💡 ANSWER: {answer}\n")
+            # Check if question is now complete
+            if self._has_question_ending(text):
+                self._process_question_buffer()
+            # Or if we've been buffering too long (timeout after 10 seconds)
+            elif time_module.time() - self.buffer_start_time > 10:
+                self._process_question_buffer()
 
         except Exception as e:
             print(f"\nError processing chunk: {e}")
+
+    def _check_and_process_buffer(self):
+        """Check if we should process buffered question due to silence"""
+        # If we're buffering and hit silence, process the question
+        if self.is_buffering_question and self.question_chunks and self.silence_count >= 1:
+            self._process_question_buffer()
+
+    def _process_question_buffer(self):
+        """Process accumulated question chunks and generate answer"""
+        import time as time_module
+
+        if not self.question_chunks:
+            self.is_buffering_question = False
+            return
+
+        # Combine all chunks into full question
+        full_question = " ".join(self.question_chunks)
+
+        # Reset buffer state
+        self.question_chunks = []
+        self.is_buffering_question = False
+
+        # Skip if too short
+        if len(full_question.split()) < 4:
+            print(f"\r🎧 Listening... (question too short: \"{full_question}\")", end="", flush=True)
+            return
+
+        print(f"\n\n⏳ Processing question: \"{full_question}\"")
+
+        # Get context
+        full_context = " ".join(self.transcript_buffer[-10:])
+        rag_context, confidence = self.rag.query(full_context)
+        vibe = analyze_vibe(full_context)
+
+        # Generate answer
+        t_start = time_module.time()
+        answer = self.answer_gen.generate_answer(full_question, rag_context)
+        t_answer = time_module.time() - t_start
+
+        if answer and not answer.startswith("["):
+            # Clear screen and show Q&A
+            print("\033[2J\033[H")  # Clear screen
+            print("=" * 70)
+            print("  🎯 MEETING INTELLIGENCE AGENT")
+            print("=" * 70)
+
+            print(f"\n❓ QUESTION:")
+            # Word wrap the question too if it's long
+            if len(full_question) > 65:
+                q_words = full_question.split()
+                q_line = "   "
+                for word in q_words:
+                    if len(q_line) + len(word) > 65:
+                        print(q_line)
+                        q_line = "   " + word
+                    else:
+                        q_line += " " + word if q_line != "   " else word
+                if q_line.strip():
+                    print(q_line)
+            else:
+                print(f"   \"{full_question}\"")
+
+            print(f"\n🎭 VIBE: {vibe['emoji']} {vibe['dominant']}")
+
+            conf_bar = "█" * int(confidence * 20) + "░" * (20 - int(confidence * 20))
+            print(f"📊 DOC MATCH: [{conf_bar}] {confidence:.0%}")
+
+            print(f"\n💡 SUGGESTED ANSWER ({t_answer:.1f}s):")
+            # Word wrap the answer
+            words = answer.split()
+            line = "   "
+            for word in words:
+                if len(line) + len(word) > 65:
+                    print(line)
+                    line = "   " + word
+                else:
+                    line += " " + word if line != "   " else word
+            if line.strip():
+                print(line)
+
+            print("\n" + "-" * 70)
+            print("🎧 Listening for next question... (Ctrl+C to stop)")
+
+            # Log Q&A to file
+            timestamp = time.strftime('%H:%M:%S')
+            with open(OUTPUT_FILE, "a") as f:
+                f.write(f"\n[{timestamp}] ❓ Q: {full_question}\n")
+                f.write(f"[{timestamp}] 💡 A: {answer}\n")
+                f.write(f"[{timestamp}] Vibe: {vibe['dominant']} | Confidence: {confidence:.0%}\n\n")
+        else:
+            print(f"\r🎧 Listening... (couldn't generate answer)", end="", flush=True)
 
     def run(self):
         """Start real-time processing"""
@@ -194,8 +372,8 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python coach.py                       # Start live capture from BlackHole
-  python coach.py --device "MacBook Pro Microphone"  # Use different device
+  python coach.py                       # Live meeting mode (BlackHole)
+  python coach.py --mic                 # Test mode (speak into microphone)
   python coach.py --test audio.wav      # Test with audio file
   python coach.py --list-devices        # List available audio devices
         """,
@@ -204,6 +382,11 @@ Examples:
         "--device", "-d",
         default="BlackHole 2ch",
         help="Audio input device name (default: BlackHole 2ch)",
+    )
+    parser.add_argument(
+        "--mic", "-m",
+        action="store_true",
+        help="Use MacBook microphone instead of BlackHole (for testing)",
     )
     parser.add_argument(
         "--test", "-t",
@@ -229,8 +412,18 @@ Examples:
         test_transcription(args.test)
         return
 
+    # Determine audio device
+    if args.mic:
+        audio_device = "MacBook Pro Microphone"
+        print("\n🎤 MIC MODE: Speak into your microphone to test")
+        print("   (Use without --mic for live meetings with BlackHole)\n")
+    else:
+        audio_device = args.device
+        print("\n🔊 MEETING MODE: Capturing from", audio_device)
+        print("   (Use --mic to test with your microphone)\n")
+
     # Start live processing
-    agent = MeetingIntelligence(audio_device=args.device)
+    agent = MeetingIntelligence(audio_device=audio_device)
     agent.run()
 
 
