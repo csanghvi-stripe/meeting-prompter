@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+ENV/
+.venv/
+
+# Models (too large for git)
+models/*.gguf
+models/*.bin
+!models/.gitkeep
+
+# Runners (platform-specific binaries)
+runners/
+
+# Output files
+output/*.txt
+output/*.log
+!output/.gitkeep
+
+# Documentation (may contain proprietary content)
+docs/*.pdf
+docs/*.docx
+docs/*.md
+!docs/.gitkeep
+
+# Working plan files
+plan.md
+
+# Test audio files
+*.wav
+*.mp3
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Temporary files
+*.tmp
+*.temp
+.cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Environment
+.env
+.env.local
