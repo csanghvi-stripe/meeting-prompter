@@ -240,16 +240,20 @@ class MeetingIntelligence:
             print(f"\r🎧 Listening... (question too short: \"{full_question}\")", end="", flush=True)
             return
 
-        print(f"\n\n⏳ Processing question: \"{full_question}\"")
+        print(f"\n\n⏳ Processing: \"{full_question[:50]}...\"" if len(full_question) > 50 else f"\n\n⏳ Processing: \"{full_question}\"")
 
-        # Get context
+        # SEMANTIC CLEANUP: Clean garbled transcription using LLM
+        print("🔧 Cleaning transcription...")
+        cleaned_question = self.answer_gen.clean_question(full_question)
+
+        # Get context using cleaned question for better RAG matching
         full_context = " ".join(self.transcript_buffer[-10:])
-        rag_context, confidence = self.rag.query(full_context)
+        rag_context, confidence = self.rag.query(cleaned_question)
         vibe = analyze_vibe(full_context)
 
-        # Generate answer
+        # Generate answer using cleaned question
         t_start = time_module.time()
-        answer = self.answer_gen.generate_answer(full_question, rag_context)
+        answer = self.answer_gen.generate_answer(cleaned_question, rag_context)
         t_answer = time_module.time() - t_start
 
         if answer and not answer.startswith("["):
@@ -259,10 +263,10 @@ class MeetingIntelligence:
             print("  🎯 MEETING INTELLIGENCE AGENT")
             print("=" * 70)
 
+            # Show CLEANED question (not raw transcription)
             print(f"\n❓ QUESTION:")
-            # Word wrap the question too if it's long
-            if len(full_question) > 65:
-                q_words = full_question.split()
+            if len(cleaned_question) > 65:
+                q_words = cleaned_question.split()
                 q_line = "   "
                 for word in q_words:
                     if len(q_line) + len(word) > 65:
@@ -273,7 +277,7 @@ class MeetingIntelligence:
                 if q_line.strip():
                     print(q_line)
             else:
-                print(f"   \"{full_question}\"")
+                print(f"   \"{cleaned_question}\"")
 
             print(f"\n🎭 VIBE: {vibe['emoji']} {vibe['dominant']}")
 
@@ -296,10 +300,11 @@ class MeetingIntelligence:
             print("\n" + "-" * 70)
             print("🎧 Listening for next question... (Ctrl+C to stop)")
 
-            # Log Q&A to file
+            # Log Q&A to file (both raw and cleaned for debugging)
             timestamp = time.strftime('%H:%M:%S')
             with open(OUTPUT_FILE, "a") as f:
-                f.write(f"\n[{timestamp}] ❓ Q: {full_question}\n")
+                f.write(f"\n[{timestamp}] 🎤 RAW: {full_question}\n")
+                f.write(f"[{timestamp}] ❓ CLEAN: {cleaned_question}\n")
                 f.write(f"[{timestamp}] 💡 A: {answer}\n")
                 f.write(f"[{timestamp}] Vibe: {vibe['dominant']} | Confidence: {confidence:.0%}\n\n")
         else:
