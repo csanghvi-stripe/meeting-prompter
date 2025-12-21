@@ -40,6 +40,7 @@ All processing happens **locally on your Mac** - no audio ever leaves your machi
    transformer architectures...
 
 📄 Source: LiquidAI_Technical_Whitepaper.pdf
+   "...optimized for edge devices with 2x faster inference and 90% less..."
 📊 Confidence: [████████░░░░░░░░░░░░] 40%
 🎭 Vibe: 👀 Engaged
 
@@ -240,7 +241,7 @@ Common fixes:
 ### Processing Pipeline
 
 ```
-Audio Chunk (2s)
+Audio Chunk (4s)
       ↓
 ┌─────────────────┐
 │ Audio Quality   │ → Skip if too quiet (prevents hallucinations)
@@ -248,7 +249,7 @@ Audio Chunk (2s)
 └─────────────────┘
       ↓
 ┌─────────────────┐
-│ LFM2-Audio      │ → Transcribe speech to text (~200ms)
+│ LFM2-Audio      │ → Transcribe speech to text (~300ms)
 └─────────────────┘
       ↓
 ┌─────────────────┐
@@ -293,6 +294,7 @@ Audio Chunk (2s)
 
 4. **Source Citations**
    - Every answer shows which document it came from
+   - Displays the matched text snippet from the source
    - Builds trust and enables verification
 
 ## Project Structure
@@ -364,7 +366,7 @@ Tested on MacBook Pro M4 Pro (16GB):
 
 | Operation | Latency |
 |-----------|---------|
-| Audio transcription | ~200ms per 2s chunk |
+| Audio transcription | ~300ms per 4s chunk |
 | Question detection | <10ms |
 | RAG lookup | <50ms |
 | Answer generation | ~500-1000ms |

@@ -17,7 +17,7 @@ class AudioCapture:
         self,
         device: str = "BlackHole 2ch",
         sample_rate: int = 16000,
-        chunk_duration: float = 2.0,
+        chunk_duration: float = 4.0,
         overlap: float = 0.5,
     ):
         self.device = device

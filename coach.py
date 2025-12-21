@@ -348,6 +348,7 @@ class MeetingIntelligence:
 
             # Source citation
             print(f"\n📄 Source: {source_file}")
+            print(f"   \"{self.rag.get_context_preview(rag_context, 120)}\"")
             conf_bar = "█" * int(confidence * 20) + "░" * (20 - int(confidence * 20))
             print(f"📊 Confidence: [{conf_bar}] {confidence:.0%}")
             print(f"🎭 Vibe: {vibe['emoji']} {vibe['dominant']}")
