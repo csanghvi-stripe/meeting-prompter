@@ -58,18 +58,41 @@ def detect_questions(text: str) -> List[Tuple[str, float]]:
 
 
 def _split_sentences(text: str) -> List[str]:
-    """Split text into sentences"""
+    """Split text into sentences, merging continuations"""
     # Split on sentence-ending punctuation
-    sentences = re.split(r'(?<=[.!?])\s+', text)
-    # Also consider phrases without punctuation (common in speech)
+    parts = re.split(r'(?<=[.!?])\s+', text)
+
+    # Merge back sentences that are clearly continuations of previous
+    continuation_starters = [
+        'help me', 'tell me', 'and', 'also', 'but', 'because',
+        'so', 'then', 'or', 'that', 'which', 'where', 'when',
+        'understand', 'explain', 'describe'
+    ]
+
+    merged = []
+    current = ""
+    for part in parts:
+        part_lower = part.lower().strip()
+        # If part starts with continuation words, merge with previous
+        if current and any(part_lower.startswith(c) for c in continuation_starters):
+            current = current + " " + part
+        else:
+            if current:
+                merged.append(current)
+            current = part
+    if current:
+        merged.append(current)
+
+    # Handle long sentences
     result = []
-    for s in sentences:
-        # If sentence is long, try splitting on question patterns
+    for s in merged:
         if len(s) > 100:
-            parts = re.split(r'(?<=[?])\s*', s)
-            result.extend(parts)
+            # Only split on ? if there's more content after
+            sub_parts = re.split(r'(?<=[?])\s+', s)
+            result.extend(sub_parts)
         else:
             result.append(s)
+
     return [s.strip() for s in result if s.strip()]
 
 
@@ -86,7 +109,9 @@ def _score_question(sentence: str) -> float:
         return 0.0
 
     # Reject fragments that are clearly incomplete
-    incomplete_endings = ['the', 'a', 'an', 'to', 'of', 'for', 'with', 'about', 'how', 'what', 'is', 'are', 'does', 'do', 'can', 'could', 'would']
+    # Note: 'me' and 'you' are VALID endings (e.g., "Can you help me?")
+    incomplete_endings = ['the', 'a', 'an', 'to', 'of', 'for', 'with', 'about',
+                         'how', 'what', 'is', 'are', 'does', 'do', 'can', 'could', 'would']
     last_word = words[-1].rstrip('?.,!') if words else ""
     if last_word in incomplete_endings:
         return 0.0

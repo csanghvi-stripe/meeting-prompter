@@ -1,4 +1,4 @@
-"""RAG Engine - Lightweight retrieval for Liquid specs"""
+"""RAG Engine - Lightweight retrieval for document Q&A"""
 import re
 from pathlib import Path
 from typing import List, Tuple
@@ -7,24 +7,42 @@ from pypdf import PdfReader
 
 
 class RAGEngine:
-    """Lightweight RAG using keyword matching (no embeddings for 8GB constraint)"""
+    """Lightweight RAG using keyword matching - loads all docs from folder"""
 
-    def __init__(self, pdf_path: Path, chunk_size: int = 500, chunk_overlap: int = 100):
-        self.pdf_path = pdf_path
+    def __init__(self, docs_dir: Path, chunk_size: int = 500, chunk_overlap: int = 100):
+        self.docs_dir = docs_dir
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
-        self.chunks: List[str] = []
-        self._load_document()
+        self.chunks: List[Tuple[str, str]] = []  # (text, source_filename)
+        self._load_all_documents()
 
-    def _load_document(self):
-        """Load and chunk the PDF document"""
-        if not self.pdf_path.exists():
-            print(f"Warning: RAG document not found: {self.pdf_path}")
-            self.chunks = ["Liquid Neural Networks (LNNs) use ODEs for continuous data streams."]
+    def _load_all_documents(self):
+        """Load all PDFs from docs directory"""
+        if not self.docs_dir.exists():
+            print(f"Warning: Docs directory not found: {self.docs_dir}")
+            self.chunks = [("No documents loaded.", "none")]
             return
 
+        pdf_files = list(self.docs_dir.glob("*.pdf"))
+        if not pdf_files:
+            print(f"Warning: No PDF files found in {self.docs_dir}")
+            self.chunks = [("No documents loaded.", "none")]
+            return
+
+        total_chunks = 0
+        for pdf_path in pdf_files:
+            chunks = self._load_pdf(pdf_path)
+            for chunk in chunks:
+                self.chunks.append((chunk, pdf_path.name))
+            total_chunks += len(chunks)
+            print(f"  Loaded {len(chunks)} chunks from {pdf_path.name}")
+
+        print(f"RAG engine ready: {total_chunks} chunks from {len(pdf_files)} documents")
+
+    def _load_pdf(self, pdf_path: Path) -> List[str]:
+        """Load and chunk a single PDF"""
         try:
-            reader = PdfReader(self.pdf_path)
+            reader = PdfReader(pdf_path)
             full_text = ""
             for page in reader.pages:
                 text = page.extract_text()
@@ -35,39 +53,40 @@ class RAGEngine:
             full_text = re.sub(r'\s+', ' ', full_text).strip()
 
             # Split into overlapping chunks
-            self.chunks = []
+            chunks = []
             step = self.chunk_size - self.chunk_overlap
             for i in range(0, len(full_text), step):
                 chunk = full_text[i:i + self.chunk_size]
                 if len(chunk) > 50:  # Skip very short chunks
-                    self.chunks.append(chunk)
+                    chunks.append(chunk)
 
-            print(f"RAG loaded {len(self.chunks)} chunks from {self.pdf_path.name}")
+            return chunks
 
         except Exception as e:
-            print(f"Warning: Failed to load RAG document: {e}")
-            self.chunks = ["Liquid Neural Networks (LNNs) use ODEs for continuous data streams."]
+            print(f"Warning: Failed to load {pdf_path.name}: {e}")
+            return []
 
-    def query(self, transcript: str, top_k: int = 1) -> Tuple[str, float]:
+    def query(self, text: str) -> Tuple[str, float, str]:
         """
         Find most relevant chunk using Jaccard similarity.
 
         Returns:
-            Tuple of (best_chunk, confidence_score)
+            Tuple of (best_chunk, confidence_score, source_filename)
         """
-        if not transcript or not transcript.strip():
-            return "", 0.0
+        if not text or not text.strip():
+            return "", 0.0, ""
 
         # Tokenize query
-        query_words = set(self._tokenize(transcript))
+        query_words = set(self._tokenize(text))
         if not query_words:
-            return "", 0.0
+            return "", 0.0, ""
 
         best_chunk = ""
         best_score = 0.0
+        best_source = ""
 
-        for chunk in self.chunks:
-            chunk_words = set(self._tokenize(chunk))
+        for chunk_text, source in self.chunks:
+            chunk_words = set(self._tokenize(chunk_text))
 
             # Jaccard similarity
             intersection = len(query_words & chunk_words)
@@ -77,9 +96,10 @@ class RAGEngine:
                 score = intersection / union
                 if score > best_score:
                     best_score = score
-                    best_chunk = chunk
+                    best_chunk = chunk_text
+                    best_source = source
 
-        return best_chunk, best_score
+        return best_chunk, best_score, best_source
 
     def _tokenize(self, text: str) -> List[str]:
         """Simple tokenization: lowercase, remove punctuation, split"""

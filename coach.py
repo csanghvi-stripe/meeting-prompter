@@ -35,7 +35,7 @@ from lib.dashboard import (
 BASE_DIR = Path(__file__).parent
 MODEL_DIR = BASE_DIR / "models"
 RUNNER_DIR = BASE_DIR / "runners" / "macos-arm64"
-DOCS_PATH = BASE_DIR / "docs" / "LiquidAI_Technical_Whitepaper.pdf"
+DOCS_DIR = BASE_DIR / "docs"  # Load all PDFs from this directory
 TEXT_MODEL = MODEL_DIR / "LFM2-1.2B-Q4_K_M.gguf"
 OUTPUT_FILE = BASE_DIR / "output" / "live_analytics.txt"
 
@@ -52,7 +52,7 @@ class MeetingIntelligence:
         display_status("LFM2-Audio ready")
 
         display_status("Loading RAG engine...")
-        self.rag = RAGEngine(DOCS_PATH)
+        self.rag = RAGEngine(DOCS_DIR)
         display_status("RAG engine ready")
 
         display_status("Loading LFM2 text model for Q&A...")
@@ -74,6 +74,10 @@ class MeetingIntelligence:
         self.silence_count = 0  # Track consecutive short/noise chunks
         self.is_buffering_question = False
         self.buffer_start_time = 0
+
+        # Context buffer - keep recent non-question chunks for merging
+        self.context_buffer = []
+        self.MAX_CONTEXT_CHUNKS = 3
 
         # Ensure output directory exists
         OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -145,6 +149,43 @@ class MeetingIntelligence:
             return True
         return False
 
+    def _normalize_text(self, text: str) -> str:
+        """
+        Light regex normalization - preserves content, only fixes obvious issues.
+        Does NOT extract or interpret - just cleans duplicate words and known mishearings.
+        """
+        import re
+
+        result = text
+
+        # 1. Fix consecutive duplicate words only
+        result = re.sub(r'\b(\w+)\s+\1\b', r'\1', result, flags=re.IGNORECASE)
+
+        # 2. Fix known mishearings (conservative, specific patterns)
+        replacements = [
+            (r'\bL\s+Those\b', 'Liquid'),
+            (r'\bLiquid\s+AI\s+Liquid\s+AI\b', 'Liquid AI'),
+            (r'\bliquid\s+liquid\b', 'Liquid'),
+        ]
+        for pattern, replacement in replacements:
+            result = re.sub(pattern, replacement, result, flags=re.IGNORECASE)
+
+        # 3. Clean whitespace
+        result = re.sub(r'\s+', ' ', result).strip()
+
+        # 4. Capitalize first letter
+        if result:
+            result = result[0].upper() + result[1:] if len(result) > 1 else result.upper()
+
+        # 5. Add ? only if clearly a question (don't force it)
+        question_starters = ['how', 'what', 'why', 'when', 'where', 'who', 'which',
+                            'can', 'could', 'would', 'help', 'tell', 'explain', 'does', 'do', 'is', 'are']
+        if result and not result.endswith('?') and not result.endswith('.'):
+            if any(result.lower().startswith(w) for w in question_starters):
+                result = result.rstrip('.!,') + '?'
+
+        return result
+
     def process_chunk(self, audio_path: Path):
         """Process a single audio chunk with intelligent question buffering"""
         try:
@@ -178,12 +219,18 @@ class MeetingIntelligence:
 
             # Check if we should start buffering a question
             if not self.is_buffering_question:
+                # Keep recent chunks in context buffer (for merging with questions)
+                self.context_buffer.append(text)
+                self.context_buffer = self.context_buffer[-self.MAX_CONTEXT_CHUNKS:]
+
                 if self._looks_like_question_start(text):
-                    # Start buffering
+                    # Start buffering - include recent context for multi-part questions
                     self.is_buffering_question = True
-                    self.question_chunks = [text]
+                    # Use context buffer to catch "Can you help me? Help me understand..."
+                    self.question_chunks = list(self.context_buffer)
                     self.buffer_start_time = time_module.time()
-                    print(f"\r🎤 Question: \"{text}\"", end="", flush=True)
+                    full_so_far = " ".join(self.question_chunks)
+                    print(f"\r🎤 Question: \"{full_so_far[:70]}\"" + ("..." if len(full_so_far) > 70 else ""), end="", flush=True)
 
                     # If it already looks complete, process it
                     if self._has_question_ending(text) and len(text.split()) >= 6:
@@ -234,6 +281,7 @@ class MeetingIntelligence:
         # Reset buffer state
         self.question_chunks = []
         self.is_buffering_question = False
+        self.context_buffer = []  # Clear context after processing
 
         # Skip if too short
         if len(full_question.split()) < 4:
@@ -242,14 +290,20 @@ class MeetingIntelligence:
 
         print(f"\n\n⏳ Processing: \"{full_question[:50]}...\"" if len(full_question) > 50 else f"\n\n⏳ Processing: \"{full_question}\"")
 
-        # SEMANTIC CLEANUP: Clean garbled transcription using LLM
-        print("🔧 Cleaning transcription...")
-        cleaned_question = self.answer_gen.clean_question(full_question)
+        # Light normalization - preserves content, only fixes obvious issues
+        cleaned_question = self._normalize_text(full_question)
 
         # Get context using cleaned question for better RAG matching
         full_context = " ".join(self.transcript_buffer[-10:])
-        rag_context, confidence = self.rag.query(cleaned_question)
+        rag_context, confidence, source_file = self.rag.query(cleaned_question)
         vibe = analyze_vibe(full_context)
+
+        # Skip if confidence too low (question doesn't match docs)
+        if confidence < 0.05:
+            print(f"\n⚠️  No match in documents ({confidence:.0%})")
+            print(f"   \"{cleaned_question[:50]}...\"")
+            print(f"🎧 Listening...")
+            return
 
         # Generate answer using cleaned question
         t_start = time_module.time()
@@ -259,9 +313,9 @@ class MeetingIntelligence:
         if answer and not answer.startswith("["):
             # Clear screen and show Q&A
             print("\033[2J\033[H")  # Clear screen
-            print("=" * 70)
+            print("━" * 70)
             print("  🎯 MEETING INTELLIGENCE AGENT")
-            print("=" * 70)
+            print("━" * 70)
 
             # Show CLEANED question (not raw transcription)
             print(f"\n❓ QUESTION:")
@@ -277,14 +331,9 @@ class MeetingIntelligence:
                 if q_line.strip():
                     print(q_line)
             else:
-                print(f"   \"{cleaned_question}\"")
+                print(f"   {cleaned_question}")
 
-            print(f"\n🎭 VIBE: {vibe['emoji']} {vibe['dominant']}")
-
-            conf_bar = "█" * int(confidence * 20) + "░" * (20 - int(confidence * 20))
-            print(f"📊 DOC MATCH: [{conf_bar}] {confidence:.0%}")
-
-            print(f"\n💡 SUGGESTED ANSWER ({t_answer:.1f}s):")
+            print(f"\n💡 ANSWER:")
             # Word wrap the answer
             words = answer.split()
             line = "   "
@@ -297,16 +346,21 @@ class MeetingIntelligence:
             if line.strip():
                 print(line)
 
-            print("\n" + "-" * 70)
+            # Source citation
+            print(f"\n📄 Source: {source_file}")
+            conf_bar = "█" * int(confidence * 20) + "░" * (20 - int(confidence * 20))
+            print(f"📊 Confidence: [{conf_bar}] {confidence:.0%}")
+            print(f"🎭 Vibe: {vibe['emoji']} {vibe['dominant']}")
+
+            print("\n" + "━" * 70)
             print("🎧 Listening for next question... (Ctrl+C to stop)")
 
-            # Log Q&A to file (both raw and cleaned for debugging)
+            # Log Q&A to file
             timestamp = time.strftime('%H:%M:%S')
             with open(OUTPUT_FILE, "a") as f:
-                f.write(f"\n[{timestamp}] 🎤 RAW: {full_question}\n")
-                f.write(f"[{timestamp}] ❓ CLEAN: {cleaned_question}\n")
+                f.write(f"\n[{timestamp}] ❓ Q: {cleaned_question}\n")
                 f.write(f"[{timestamp}] 💡 A: {answer}\n")
-                f.write(f"[{timestamp}] Vibe: {vibe['dominant']} | Confidence: {confidence:.0%}\n\n")
+                f.write(f"[{timestamp}] 📄 Source: {source_file} | Confidence: {confidence:.0%}\n\n")
         else:
             print(f"\r🎧 Listening... (couldn't generate answer)", end="", flush=True)
 
@@ -336,7 +390,7 @@ def test_transcription(audio_file: Path):
     display_status("Test mode: Single file transcription with Q&A")
 
     lfm2 = LFM2Wrapper(MODEL_DIR, RUNNER_DIR)
-    rag = RAGEngine(DOCS_PATH)
+    rag = RAGEngine(DOCS_DIR)
 
     display_status("Loading Q&A engine...")
     answer_gen = AnswerGenerator(TEXT_MODEL)
@@ -353,8 +407,9 @@ def test_transcription(audio_file: Path):
     vibe = analyze_vibe(text)
     print(f"🎭 Vibe: {get_vibe_summary(vibe)}")
 
-    context, confidence = rag.query(text)
+    context, confidence, source_file = rag.query(text)
     print(f"📊 RAG Confidence: {format_confidence(confidence)}")
+    print(f"📄 Source: {source_file}")
     print(f"📄 Context: {rag.get_context_preview(context, 200)}")
 
     # Check for questions and generate answers
@@ -367,6 +422,7 @@ def test_transcription(audio_file: Path):
             print("\n💡 SUGGESTED ANSWER:")
             answer = answer_gen.generate_answer(question_text, context)
             print(f"   {answer}")
+            print(f"\n📄 Source: {source_file}")
     else:
         print("\n❓ No question detected in transcript")
 

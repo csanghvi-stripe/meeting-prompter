@@ -27,21 +27,24 @@ All processing happens **locally on your Mac** - no audio ever leaves your machi
 ## Demo
 
 ```
-============================================================
-  Real-Time Meeting Intelligence Agent
-  Powered by LFM2-Audio | 100% Local Processing
-============================================================
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  🎯 MEETING INTELLIGENCE AGENT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-[STATUS] LFM2-Audio ready
-[STATUS] RAG engine ready (55 chunks loaded)
-[STATUS] Q&A engine ready
-[STATUS] Listening to BlackHole 2ch...
+❓ QUESTION:
+   How does Liquid AI handle edge deployment?
 
-[CPU: 45% RAM: 62%] 🔥 Excited      Conf: 35% │ How does Liquid AI handle...
+💡 ANSWER:
+   Liquid AI models are optimized for edge devices with 2x faster
+   inference and 90% less memory usage compared to traditional
+   transformer architectures...
 
-💡 SUGGESTED ANSWER:
-   Liquid AI's architecture, including the Liquid Time-constant Model,
-   is optimized for real-time audio processing with sub-100ms latency...
+📄 Source: LiquidAI_Technical_Whitepaper.pdf
+📊 Confidence: [████████░░░░░░░░░░░░] 40%
+🎭 Vibe: 👀 Engaged
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🎧 Listening for next question... (Ctrl+C to stop)
 ```
 
 ## Requirements
@@ -232,18 +235,78 @@ Common fixes:
 - Make sure BlackHole 2ch is checked in the Multi-Output Device settings
 - Restart the meeting app after changing audio settings
 
+## Architecture
+
+### Processing Pipeline
+
+```
+Audio Chunk (2s)
+      ↓
+┌─────────────────┐
+│ Audio Quality   │ → Skip if too quiet (prevents hallucinations)
+│ Check           │
+└─────────────────┘
+      ↓
+┌─────────────────┐
+│ LFM2-Audio      │ → Transcribe speech to text (~200ms)
+└─────────────────┘
+      ↓
+┌─────────────────┐
+│ Question Buffer │ → Accumulate until complete thought
+└─────────────────┘
+      ↓
+┌─────────────────┐
+│ Normalize       │ → Fix ASR stutters, strip filler
+└─────────────────┘
+      ↓
+┌─────────────────┐
+│ RAG Query       │ → Search ALL docs, return best match + source
+└─────────────────┘
+      ↓
+┌─────────────────┐
+│ Confidence Gate │ → Skip if <5% match (irrelevant question)
+└─────────────────┘
+      ↓
+┌─────────────────┐
+│ Answer Generate │ → LFM2-1.2B with RAG context
+└─────────────────┘
+      ↓
+┌─────────────────┐
+│ Display         │ → Question, Answer, Source, Confidence
+└─────────────────┘
+```
+
+### Key Features
+
+1. **Multi-Document RAG**
+   - Loads ALL PDFs from `docs/` directory
+   - Tracks source file for each chunk
+   - Cites source document with every answer
+
+2. **Audio Quality Check**
+   - Skips quiet/silent audio chunks
+   - Prevents hallucinations from background noise
+
+3. **Confidence-Based Filtering**
+   - Questions that don't match documents are skipped
+   - Only generates answers when confidence ≥5%
+
+4. **Source Citations**
+   - Every answer shows which document it came from
+   - Builds trust and enables verification
+
 ## Project Structure
 
 ```
 meeting-prompter/
-├── coach.py                    # Main entry point
+├── coach.py                    # Main orchestrator
 ├── lib/
 │   ├── lfm2_wrapper.py        # LFM2-Audio subprocess interface
 │   ├── audio_capture.py       # BlackHole streaming + chunking
-│   ├── question_detector.py   # Automatic question detection
+│   ├── question_detector.py   # Question detection + sentence merging
 │   ├── answer_generator.py    # LFM2 text model for Q&A
 │   ├── vibe_check.py          # Emotional category detection
-│   ├── rag_engine.py          # Lightweight RAG for docs
+│   ├── rag_engine.py          # Lightweight BM25-style RAG
 │   └── dashboard.py           # Terminal display
 ├── models/                     # GGUF model files
 ├── runners/                    # llama.cpp binaries
@@ -255,7 +318,23 @@ meeting-prompter/
 
 ### Add Your Own Documentation
 
-Place PDF files in the `docs/` directory. The RAG engine will automatically index them for context retrieval.
+Place PDF files in the `docs/` directory. The RAG engine will automatically:
+- Load **all PDFs** in the directory
+- Chunk and index each document
+- Track which document each chunk came from
+- Cite sources in answers
+
+```bash
+# Example: Add multiple documents
+cp product_guide.pdf docs/
+cp technical_specs.pdf docs/
+cp faq.pdf docs/
+
+# Restart the agent to reload
+python coach.py --mic
+```
+
+The agent works with **any domain** - just provide relevant documents.
 
 ### Tune Question Detection
 

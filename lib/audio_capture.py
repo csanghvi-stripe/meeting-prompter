@@ -57,9 +57,18 @@ class AudioCapture:
                         daemon=True
                     ).start()
 
+    def _check_audio_level(self, audio_data: np.ndarray) -> bool:
+        """Check if audio level is sufficient for transcription"""
+        level = np.max(np.abs(audio_data))
+        return level > 0.01  # Skip very quiet chunks (likely silence/noise)
+
     def _process_chunk(self, chunk: np.ndarray):
         """Save chunk to temp file and call callback"""
         try:
+            # Skip quiet chunks to avoid hallucinations
+            if not self._check_audio_level(chunk):
+                return
+
             # Save to temporary WAV file
             with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
                 temp_path = Path(f.name)
