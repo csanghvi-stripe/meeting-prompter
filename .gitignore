@@ -44,3 +44,8 @@ output/*.log
 resources/
 
 docs/
+archive*
+# ColBERT index and embeddings cache
+data/colbert_index/
+data/*.json
+data/*.db
