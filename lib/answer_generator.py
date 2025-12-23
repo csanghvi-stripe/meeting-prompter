@@ -101,7 +101,7 @@ class AnswerGenerator:
         if len(question) > 200:
             question = question[:200] + "..."
 
-        prompt = f"""Answer the question using the context. Be concise.
+        prompt = f"""Answer the question using ONLY the context below. Be concise. If the context doesn't contain relevant information, say "I don't have information on that."
 
 Context: {context}
 

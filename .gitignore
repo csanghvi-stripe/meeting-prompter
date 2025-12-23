@@ -5,30 +5,22 @@ __pycache__/
 *.so
 .Python
 venv/
-ENV/
 .venv/
+ENV/
 
-# Models (too large for git)
+.claude
+
+# Models (download separately, ~2.6GB total)
 models/*.gguf
 models/*.bin
-!models/.gitkeep
 
-# Runners (platform-specific binaries)
-runners/
+# Runners (download separately)
+runners/**/*
+!runners/.gitkeep
 
-# Output files
+# Output logs (generated at runtime)
 output/*.txt
 output/*.log
-!output/.gitkeep
-
-# Documentation (may contain proprietary content)
-docs/*.pdf
-docs/*.docx
-docs/*.md
-!docs/.gitkeep
-
-# Working plan files
-plan.md
 
 # Test audio files
 *.wav
@@ -43,17 +35,12 @@ plan.md
 
 # macOS
 .DS_Store
-.AppleDouble
-.LSOverride
-
-# Temporary files
-*.tmp
-*.temp
-.cache/
-
-# Jupyter
-.ipynb_checkpoints/
 
 # Environment
 .env
 .env.local
+
+# Internal resources
+resources/
+
+docs/

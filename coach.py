@@ -299,7 +299,7 @@ class MeetingIntelligence:
         vibe = analyze_vibe(full_context)
 
         # Skip if confidence too low (question doesn't match docs)
-        if confidence < 0.05:
+        if confidence < 0.30:
             print(f"\n⚠️  No match in documents ({confidence:.0%})")
             print(f"   \"{cleaned_question[:50]}...\"")
             print(f"🎧 Listening...")
