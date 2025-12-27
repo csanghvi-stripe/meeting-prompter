@@ -9,6 +9,10 @@ Features:
 - Constant-Memory RAG: Local document retrieval
 - Privacy Moat: All processing stays on-device
 """
+import os
+# Suppress tokenizer parallelism warning (must be before any HuggingFace imports)
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 import argparse
 import sys
 import time
@@ -22,8 +26,9 @@ from lib.lfm2_wrapper import LFM2Wrapper
 from lib.audio_capture import AudioCapture, list_audio_devices
 from lib.vibe_check import analyze_vibe, get_vibe_summary
 from lib.rag_engine import RAGEngine, format_confidence
-from lib.question_detector import detect_questions, get_primary_question
-from lib.answer_generator import AnswerGenerator
+from lib.question_detector import detect_questions, get_primary_question, get_question_score
+from lib.hybrid_answerer import HybridAnswerer
+from lib.question_buffer import QuestionBuffer, BufferConfig
 from lib.dashboard import (
     display_header,
     display_status,
@@ -36,7 +41,7 @@ BASE_DIR = Path(__file__).parent
 MODEL_DIR = BASE_DIR / "models"
 RUNNER_DIR = BASE_DIR / "runners" / "macos-arm64"
 DOCS_DIR = BASE_DIR / "docs"  # Load all PDFs from this directory
-TEXT_MODEL = MODEL_DIR / "LFM2-1.2B-Q4_K_M.gguf"
+RAG_MODEL = MODEL_DIR / "LFM2-1.2B-RAG-Q4_K_M.gguf"  # RAG-specialized model for answer generation
 OUTPUT_FILE = BASE_DIR / "output" / "live_analytics.txt"
 
 
@@ -44,6 +49,12 @@ class MeetingIntelligence:
     """Real-time meeting intelligence agent with Q&A"""
 
     def __init__(self, audio_device: str = "BlackHole 2ch"):
+        """
+        Initialize the meeting intelligence agent.
+
+        Args:
+            audio_device: Audio input device name
+        """
         display_header()
 
         # Initialize components
@@ -55,10 +66,13 @@ class MeetingIntelligence:
         self.rag = RAGEngine(DOCS_DIR)
         display_status("RAG engine ready")
 
-        display_status("Loading LFM2 text model for Q&A...")
-        self.answer_gen = AnswerGenerator(TEXT_MODEL)
-        self.answer_gen.load()
-        display_status("Q&A engine ready")
+        # Hybrid answerer - extraction for grounding + LLM for fluency
+        display_status("Loading LFM2-1.2B-RAG model...")
+        self.answerer = HybridAnswerer(
+            model_path=RAG_MODEL,
+            use_generation=True,  # Always use generation by default
+        )
+        display_status("Hybrid answerer ready (extraction + generation)")
 
         self.audio = AudioCapture(device=audio_device)
 
@@ -69,18 +83,89 @@ class MeetingIntelligence:
         self.confidence_sum = 0.0
         self.last_answer = ""  # Cache last generated answer
 
-        # Question buffering - accumulate until pause detected
-        self.question_chunks = []  # Accumulate multiple chunks
-        self.silence_count = 0  # Track consecutive short/noise chunks
-        self.is_buffering_question = False
-        self.buffer_start_time = 0
+        # Thread-safe question buffering with time-based pause detection
+        self.question_buffer = QuestionBuffer(BufferConfig(
+            pause_threshold=1.5,      # 1.5 seconds of silence triggers flush
+            max_buffer_time=8.0,      # 8 second max buffer time
+            min_words=4,              # Minimum words for valid question
+            confidence_threshold=0.3  # Minimum question confidence
+        ))
 
-        # Context buffer - keep recent non-question chunks for merging
-        self.context_buffer = []
-        self.MAX_CONTEXT_CHUNKS = 3
+        # Wire up silence callback from AudioCapture to QuestionBuffer
+        self.audio.on_silence = self._on_silence
 
         # Ensure output directory exists
         OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+    def _is_hallucination(self, text: str) -> bool:
+        """
+        Detect LFM2-Audio hallucination patterns.
+
+        The model tends to hallucinate these patterns when given noise/silence.
+        """
+        text_lower = text.lower().strip()
+
+        # Common hallucination starters - vague statements that don't relate to context
+        hallucination_starters = [
+            "i don't know what",
+            "i'm not sure what",
+            "she chose",
+            "he chose",
+            "they chose",
+            "it's just the",
+            "it's going to be",
+            "that's going to be",
+            "you're going to",
+            "we're going to",
+            "the one that was",
+            "the reason why",
+            "i think it's",
+            "i think that",
+            "i guess",
+            "i suppose",
+            "maybe it's",
+            "perhaps it's",
+            "it seems like",
+            "it looks like",
+            "sort of",
+            "kind of like",
+        ]
+
+        for starter in hallucination_starters:
+            if text_lower.startswith(starter):
+                return True
+
+        # Third-person statements are usually hallucinations (not questions to us)
+        third_person_starters = ["she ", "he ", "they ", "it was ", "there was "]
+        for starter in third_person_starters:
+            if text_lower.startswith(starter):
+                return True
+
+        # Very vague questions without any specific topic
+        vague_questions = [
+            "can you explain to me",
+            "can you tell me",
+            "can you help me",
+            "tell me about",
+            "explain to me",
+            "what do you mean",
+            "what does that mean",
+        ]
+        text_clean = text_lower.rstrip('?.,!')
+        if text_clean in vague_questions:
+            return True
+
+        # Repetitive/circular phrases (hallucination symptom)
+        words = text_lower.split()
+        if len(words) >= 6:
+            # Check for repeated 3-word sequences
+            for i in range(len(words) - 5):
+                seq = " ".join(words[i:i+3])
+                rest = " ".join(words[i+3:])
+                if seq in rest:
+                    return True
+
+        return False
 
     def _is_noise(self, text: str) -> bool:
         """Check if text is just filler words/noise that should be ignored"""
@@ -89,6 +174,10 @@ class MeetingIntelligence:
 
         # Too short to be meaningful
         if len(words) < 3:
+            return True
+
+        # Check for hallucination patterns first
+        if self._is_hallucination(text):
             return True
 
         # Common filler phrases to ignore
@@ -123,31 +212,12 @@ class MeetingIntelligence:
 
         return False
 
-    def _looks_like_question_start(self, text: str) -> bool:
-        """Check if text looks like the start of a question"""
-        text_lower = text.lower().strip()
-        words = text_lower.split()
-        if not words:
-            return False
-
-        # Question starters
-        question_starters = ['what', 'how', 'why', 'when', 'where', 'who', 'which',
-                            'can', 'could', 'would', 'will', 'does', 'do', 'is', 'are',
-                            'tell', 'explain', 'describe', 'help']
-
-        first_word = words[0].rstrip('.,?!')
-        return first_word in question_starters
-
-    def _has_question_ending(self, text: str) -> bool:
-        """Check if text has a clear question ending"""
-        text = text.strip()
-        # Ends with question mark
-        if text.endswith('?'):
-            return True
-        # Long enough sentence ending with period (likely complete thought)
-        if text.endswith('.') and len(text.split()) >= 8:
-            return True
-        return False
+    def _on_silence(self, timestamp: float):
+        """Called when silence is detected in audio stream"""
+        # Let buffer check if pause threshold reached
+        question = self.question_buffer.on_silence(timestamp)
+        if question:
+            self._process_complete_question(question)
 
     def _normalize_text(self, text: str) -> str:
         """
@@ -186,106 +256,89 @@ class MeetingIntelligence:
 
         return result
 
-    def process_chunk(self, audio_path: Path):
+    def process_chunk(self, audio_path: Path, timestamp: float = None):
         """Process a single audio chunk with intelligent question buffering"""
+        import time as time_module
+        timestamp = timestamp or time_module.time()
+
         try:
-            import time as time_module
-
             # 1. Transcribe audio
-            t_start = time_module.time()
             text = self.lfm2.transcribe(audio_path)
-            t_transcribe = time_module.time() - t_start
 
+            # 2. Handle empty/error transcriptions
             if not text or text.startswith("["):
-                self.silence_count += 1
-                self._check_and_process_buffer()
+                # Transcription failed or returned noise marker
+                # Force flush buffer if we have content (indicates pause)
+                question = self.question_buffer.force_flush()
+                if question:
+                    self._process_complete_question(question)
                 return
 
-            # Check if this is noise/filler
-            is_noise = self._is_noise(text)
-
-            if is_noise:
-                self.silence_count += 1
-                self._check_and_process_buffer()
+            # 3. Handle filler/noise
+            if self._is_noise(text):
                 print(f"\r🎧 Listening...                                        ", end="", flush=True)
+                # Noise also indicates pause - check buffer
+                question = self.question_buffer.force_flush()
+                if question:
+                    self._process_complete_question(question)
                 return
 
-            # Meaningful content - reset silence counter
-            self.silence_count = 0
-
-            # Add to transcript buffer
+            # 4. Add to transcript buffer for context
             self.transcript_buffer.append(text)
             self.chunk_count += 1
 
-            # Check if we should start buffering a question
-            if not self.is_buffering_question:
-                # Keep recent chunks in context buffer (for merging with questions)
-                self.context_buffer.append(text)
-                self.context_buffer = self.context_buffer[-self.MAX_CONTEXT_CHUNKS:]
+            # 5. Add to question buffer - may return complete question
+            question = self.question_buffer.add_chunk(text, timestamp)
 
-                if self._looks_like_question_start(text):
-                    # Start buffering - include recent context for multi-part questions
-                    self.is_buffering_question = True
-                    # Use context buffer to catch "Can you help me? Help me understand..."
-                    self.question_chunks = list(self.context_buffer)
-                    self.buffer_start_time = time_module.time()
-                    full_so_far = " ".join(self.question_chunks)
-                    print(f"\r🎤 Question: \"{full_so_far[:70]}\"" + ("..." if len(full_so_far) > 70 else ""), end="", flush=True)
-
-                    # If it already looks complete, process it
-                    if self._has_question_ending(text) and len(text.split()) >= 6:
-                        self._process_question_buffer()
-                    return
+            if question:
+                # Buffer returned a complete question
+                self._process_complete_question(question)
+            else:
+                # Show what we're buffering
+                status = self.question_buffer.get_status()
+                if status["is_buffering"]:
+                    preview = status["text_preview"]
+                    score = get_question_score(preview) if preview else 0
+                    if score > 0.2:
+                        print(f"\r🎤 \"{preview[:60]}...\" ", end="", flush=True)
+                    else:
+                        print(f"\r🎧 \"{text[:60]}\"" + ("..." if len(text) > 60 else ""), end="", flush=True)
                 else:
-                    # Not a question, just show what we heard
                     print(f"\r🎧 \"{text[:60]}\"" + ("..." if len(text) > 60 else ""), end="", flush=True)
 
-                    # Log to file
-                    timestamp = time.strftime('%H:%M:%S')
-                    with open(OUTPUT_FILE, "a") as f:
-                        f.write(f"[{timestamp}] {text}\n")
-                    return
-
-            # We're buffering a question - add this chunk
-            self.question_chunks.append(text)
-            full_question = " ".join(self.question_chunks)
-            print(f"\r🎤 Question: \"{full_question[:70]}\"" + ("..." if len(full_question) > 70 else ""), end="", flush=True)
-
-            # Check if question is now complete
-            if self._has_question_ending(text):
-                self._process_question_buffer()
-            # Or if we've been buffering too long (timeout after 10 seconds)
-            elif time_module.time() - self.buffer_start_time > 10:
-                self._process_question_buffer()
+                # Log non-question speech to file
+                log_timestamp = time.strftime('%H:%M:%S')
+                with open(OUTPUT_FILE, "a") as f:
+                    f.write(f"[{log_timestamp}] {text}\n")
 
         except Exception as e:
             print(f"\nError processing chunk: {e}")
 
-    def _check_and_process_buffer(self):
-        """Check if we should process buffered question due to silence"""
-        # If we're buffering and hit silence, process the question
-        if self.is_buffering_question and self.question_chunks and self.silence_count >= 1:
-            self._process_question_buffer()
-
-    def _process_question_buffer(self):
-        """Process accumulated question chunks and generate answer"""
+    def _process_complete_question(self, full_question: str):
+        """Process a complete question from the buffer and generate answer"""
         import time as time_module
 
-        if not self.question_chunks:
-            self.is_buffering_question = False
+        if not full_question:
             return
-
-        # Combine all chunks into full question
-        full_question = " ".join(self.question_chunks)
-
-        # Reset buffer state
-        self.question_chunks = []
-        self.is_buffering_question = False
-        self.context_buffer = []  # Clear context after processing
 
         # Skip if too short
         if len(full_question.split()) < 4:
-            print(f"\r🎧 Listening... (question too short: \"{full_question}\")", end="", flush=True)
+            print(f"\r🎧 Listening... (too short)", end="", flush=True)
+            return
+
+        # Skip hallucinations
+        if self._is_hallucination(full_question):
+            print(f"\r🎧 Listening... (filtered)", end="", flush=True)
+            return
+
+        # Check question confidence - must look like an actual question
+        question_score = get_question_score(full_question)
+        if question_score < 0.25:
+            # Log but don't process - not a real question
+            log_timestamp = time.strftime('%H:%M:%S')
+            with open(OUTPUT_FILE, "a") as f:
+                f.write(f"[{log_timestamp}] {full_question}\n")
+            print(f"\r🎧 \"{full_question[:50]}...\"" if len(full_question) > 50 else f"\r🎧 \"{full_question}\"", end="", flush=True)
             return
 
         print(f"\n\n⏳ Processing: \"{full_question[:50]}...\"" if len(full_question) > 50 else f"\n\n⏳ Processing: \"{full_question}\"")
@@ -305,12 +358,15 @@ class MeetingIntelligence:
             print(f"🎧 Listening...")
             return
 
-        # Generate answer using cleaned question
+        # Generate answer using hybrid pipeline (extraction + LFM2-1.2B-RAG)
         t_start = time_module.time()
-        answer = self.answer_gen.generate_answer(cleaned_question, rag_context)
+        answer, extraction_confidence, method = self.answerer.answer(
+            question=cleaned_question,
+            rag_context=rag_context,
+        )
         t_answer = time_module.time() - t_start
 
-        if answer and not answer.startswith("["):
+        if answer and not answer.startswith("[I don't") and method != "no_match":
             # Clear screen and show Q&A
             print("\033[2J\033[H")  # Clear screen
             print("━" * 70)
@@ -334,17 +390,31 @@ class MeetingIntelligence:
                 print(f"   {cleaned_question}")
 
             print(f"\n💡 ANSWER:")
-            # Word wrap the answer
-            words = answer.split()
-            line = "   "
-            for word in words:
-                if len(line) + len(word) > 65:
+            # Display answer preserving bullet structure
+            answer_lines = answer.split('\n')
+            for ans_line in answer_lines:
+                ans_line = ans_line.strip()
+                if not ans_line:
+                    continue
+                # Check if it's a bullet point or labeled section
+                is_bullet = ans_line.startswith('•') or ans_line.startswith('-')
+                is_label = any(ans_line.startswith(label) for label in
+                              ['SHORT ANSWER:', 'WHY IT MATTERS:', 'PROOF POINT:'])
+
+                if is_bullet or is_label:
+                    print()  # Blank line before each bullet/section
+
+                # Word wrap this line
+                words = ans_line.split()
+                line = "   "
+                for word in words:
+                    if len(line) + len(word) > 65:
+                        print(line)
+                        line = "   " + word
+                    else:
+                        line += " " + word if line != "   " else word
+                if line.strip():
                     print(line)
-                    line = "   " + word
-                else:
-                    line += " " + word if line != "   " else word
-            if line.strip():
-                print(line)
 
             # Source citation
             print(f"\n📄 Source: {source_file}")
@@ -352,6 +422,10 @@ class MeetingIntelligence:
             conf_bar = "█" * int(confidence * 20) + "░" * (20 - int(confidence * 20))
             print(f"📊 Confidence: [{conf_bar}] {confidence:.0%}")
             print(f"🎭 Vibe: {vibe['emoji']} {vibe['dominant']}")
+
+            # Show which method was used
+            method_label = "LFM2-RAG" if method == "hybrid" else "Extraction"
+            print(f"⚡ Method: {method_label} ({t_answer:.1f}s)")
 
             print("\n" + "━" * 70)
             print("🎧 Listening for next question... (Ctrl+C to stop)")
@@ -363,19 +437,22 @@ class MeetingIntelligence:
                 f.write(f"[{timestamp}] 💡 A: {answer}\n")
                 f.write(f"[{timestamp}] 📄 Source: {source_file} | Confidence: {confidence:.0%}\n\n")
         else:
-            print(f"\r🎧 Listening... (couldn't generate answer)", end="", flush=True)
+            print(f"\r🎧 Listening... (no answer found)", end="", flush=True)
 
     def run(self):
         """Start real-time processing"""
         display_status(f"Listening to {self.audio.device}...")
         display_status(f"Output file: {OUTPUT_FILE}")
-        print()  # Empty line before updates
+        print(f"\n📝 Mode: Hybrid (extraction + LFM2-1.2B-RAG generation)")
+        print(f"   Press Ctrl+C to stop\n")
 
+        self._running = True
         try:
             self.audio.start_stream(self.process_chunk)
         except KeyboardInterrupt:
             pass
         finally:
+            self._running = False
             self.show_summary()
 
     def show_summary(self):
@@ -392,11 +469,7 @@ def test_transcription(audio_file: Path):
 
     lfm2 = LFM2Wrapper(MODEL_DIR, RUNNER_DIR)
     rag = RAGEngine(DOCS_DIR)
-
-    display_status("Loading Q&A engine...")
-    answer_gen = AnswerGenerator(TEXT_MODEL)
-    answer_gen.load()
-    display_status("Q&A engine ready")
+    answerer = HybridAnswerer(RAG_MODEL, use_generation=True)
 
     # Resolve to absolute path
     audio_file = audio_file.resolve()
@@ -420,10 +493,11 @@ def test_transcription(audio_file: Path):
         print(f"\n❓ Question Detected (confidence: {score:.0%}):\n   {question_text}")
 
         if score > 0.3:
-            print("\n💡 SUGGESTED ANSWER:")
-            answer = answer_gen.generate_answer(question_text, context)
+            print("\n💡 ANSWER (Hybrid Pipeline):")
+            answer, extraction_conf, method = answerer.answer(question_text, context)
             print(f"   {answer}")
             print(f"\n📄 Source: {source_file}")
+            print(f"⚡ Method: {'LFM2-RAG' if method == 'hybrid' else 'Extraction'}")
     else:
         print("\n❓ No question detected in transcript")
 
@@ -434,10 +508,15 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python coach.py                       # Live meeting mode (BlackHole)
-  python coach.py --mic                 # Test mode (speak into microphone)
-  python coach.py --test audio.wav      # Test with audio file
-  python coach.py --list-devices        # List available audio devices
+  python coach.py                  # Live meeting mode (BlackHole)
+  python coach.py --mic            # Test mode (speak into microphone)
+  python coach.py --test audio.wav # Test with audio file
+  python coach.py --list-devices   # List available audio devices
+
+Answer Mode:
+  Hybrid mode - extraction for grounding + LFM2-1.2B-RAG for fluent answers.
+  Stage 1: Extract relevant sentences from documents (grounding)
+  Stage 2: Generate fluent answer with RAG-specialized model
         """,
     )
     parser.add_argument(

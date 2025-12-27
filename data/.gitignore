@@ -1,0 +1,7 @@
+# Ignore all generated index files
+colbert_index/
+*.db
+*.json
+
+# Keep this .gitignore
+!.gitignore

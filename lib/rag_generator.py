@@ -1,0 +1,218 @@
+"""RAG Answer Generator using LFM2-1.2B-RAG model.
+
+This module provides LLM-based answer generation using the LFM2-1.2B-RAG model,
+which is specifically trained for RAG (Retrieval-Augmented Generation) tasks.
+
+The model uses ChatML format and is optimized for:
+- Following provided context strictly
+- Generating concise, factual answers
+- Multi-turn conversations with document context
+"""
+
+from pathlib import Path
+from typing import Optional
+
+from llama_cpp import Llama
+
+
+# ChatML prompt template for LFM2-1.2B-RAG
+# The model was trained on 1M+ multi-turn, multi-document RAG samples
+RAG_PROMPT_TEMPLATE = """<|im_start|>user
+Use the following context to answer the question. Be concise and direct.
+Only use information from the provided context. If the context doesn't contain
+the answer, say so.
+
+CONTEXT:
+{context}
+
+QUESTION: {question}<|im_end|>
+<|im_start|>assistant
+"""
+
+
+class RAGAnswerGenerator:
+    """
+    Generates answers using LFM2-1.2B-RAG with grounded context.
+
+    This generator is designed to work with pre-extracted context from
+    the retrieval stage. It uses the ChatML format expected by LFM2-1.2B-RAG.
+
+    Attributes:
+        model_path: Path to the GGUF model file
+        n_ctx: Context window size (default 2048)
+        llm: Loaded Llama model instance (lazy loaded)
+    """
+
+    def __init__(self, model_path: Path, n_ctx: int = 2048):
+        """
+        Initialize the RAG answer generator.
+
+        Args:
+            model_path: Path to LFM2-1.2B-RAG GGUF model
+            n_ctx: Context window size (default 2048 tokens)
+        """
+        self.model_path = model_path
+        self.n_ctx = n_ctx
+        self.llm: Optional[Llama] = None
+
+    def load(self) -> None:
+        """
+        Lazy load the model.
+
+        The model is loaded on first use to save memory during startup.
+        Uses Metal GPU acceleration on Mac for faster inference.
+        """
+        if self.llm is None:
+            self.llm = Llama(
+                model_path=str(self.model_path),
+                n_ctx=self.n_ctx,
+                n_gpu_layers=-1,  # Use Metal GPU on Mac
+                verbose=False,
+            )
+
+    def _reset_state(self) -> None:
+        """
+        Reset model state before each generation to prevent KV cache issues.
+
+        The llama_decode error can occur when the KV cache gets corrupted.
+        Resetting before each call prevents this.
+        """
+        if self.llm is not None:
+            try:
+                self.llm.reset()
+            except Exception:
+                # If reset fails, reload the model
+                self.llm = None
+                self.load()
+
+    def generate(
+        self,
+        question: str,
+        context: str,
+        max_tokens: int = 200,
+    ) -> str:
+        """
+        Generate an answer from question and grounded context.
+
+        Uses the ChatML format expected by LFM2-1.2B-RAG:
+        - <|im_start|>user ... <|im_end|>
+        - <|im_start|>assistant ...
+
+        Args:
+            question: The user's question
+            context: Pre-extracted/grounded context from retrieval
+            max_tokens: Maximum tokens in response (default 200)
+
+        Returns:
+            Generated answer string, or error message on failure
+        """
+        self.load()
+        self._reset_state()  # Reset before each generation to prevent KV cache issues
+
+        # Truncate inputs to fit context window
+        # Leave room for prompt template and generation
+        max_context_chars = 1500
+        max_question_chars = 200
+
+        truncated_context = context[:max_context_chars]
+        truncated_question = question[:max_question_chars]
+
+        # Build prompt using ChatML format
+        prompt = RAG_PROMPT_TEMPLATE.format(
+            context=truncated_context,
+            question=truncated_question,
+        )
+
+        try:
+            response = self.llm(
+                prompt,
+                max_tokens=max_tokens,
+                stop=[
+                    "<|im_end|>",
+                    "<|im_start|>",
+                    "\n\nQUESTION:",
+                    "\n\nCONTEXT:",
+                    "---",
+                ],
+                temperature=0,  # Greedy decoding for factual responses
+                top_p=1.0,
+            )
+
+            answer = response["choices"][0]["text"].strip()
+
+            # Validate we got a real answer
+            if not answer:
+                return "[Unable to generate answer]"
+
+            # Clean up any trailing incomplete sentences
+            answer = self._clean_answer(answer)
+
+            return answer
+
+        except Exception as e:
+            print(f"[RAG Generator] Error: {e}")
+            return "[Let me get back to you on that]"
+
+    def _clean_answer(self, answer: str) -> str:
+        """
+        Clean up generated answer.
+
+        Handles common issues like:
+        - Trailing incomplete sentences
+        - Excessive whitespace
+        - Repetitive content
+        """
+        if not answer:
+            return answer
+
+        # Remove excessive whitespace
+        answer = " ".join(answer.split())
+
+        # If answer ends mid-sentence (no punctuation), try to truncate cleanly
+        if answer and answer[-1] not in ".!?:":
+            # Find last complete sentence
+            for punct in [". ", "! ", "? "]:
+                last_idx = answer.rfind(punct)
+                if last_idx > len(answer) * 0.5:  # Keep at least half
+                    answer = answer[: last_idx + 1]
+                    break
+
+        return answer
+
+
+def test_rag_generator():
+    """Test the RAG generator with sample context."""
+    from pathlib import Path
+
+    model_path = Path("models/LFM2-1.2B-RAG-Q4_K_M.gguf")
+    if not model_path.exists():
+        print(f"Model not found: {model_path}")
+        return
+
+    print("Loading RAG generator...")
+    gen = RAGAnswerGenerator(model_path)
+    gen.load()
+    print("Model loaded!")
+
+    # Test with sample context
+    context = """## The LEAP Platform Components
+
+LEAP stands for Liquid Edge AI Platform and transforms cutting-edge AI research
+into deployable business solutions. The platform includes a Model Library with
+models ranging from LFM2-350M through 8.3B with optimized variants. The Fine-Tuning
+CLI provides LoRA adapters, data pipeline tools, training infrastructure, and an
+evaluation suite. The Edge SDK is cross-platform supporting macOS, Windows, Linux,
+iOS, and Android."""
+
+    question = "What is LEAP?"
+
+    print(f"\nQuestion: {question}")
+    print(f"Context: {context[:100]}...")
+    print("\nGenerating answer...")
+
+    answer = gen.generate(question, context)
+    print(f"\nAnswer: {answer}")
+
+
+if __name__ == "__main__":
+    test_rag_generator()

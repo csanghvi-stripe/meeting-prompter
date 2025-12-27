@@ -201,3 +201,62 @@ def get_primary_question(text: str) -> Optional[Tuple[str, float]]:
         return None
     # Return highest scoring question
     return max(questions, key=lambda x: x[1])
+
+
+def is_question_complete(text: str, min_confidence: float = 0.3, min_words: int = 4) -> bool:
+    """
+    Determine if text represents a complete question.
+
+    Uses confidence scoring and structural analysis instead of relying
+    on punctuation (which transcription often omits).
+
+    Args:
+        text: The text to analyze
+        min_confidence: Minimum question confidence score (0.0-1.0)
+        min_words: Minimum word count for a complete question
+
+    Returns:
+        True if text appears to be a complete question
+    """
+    if not text or not text.strip():
+        return False
+
+    words = text.split()
+
+    # Too short to be complete
+    if len(words) < min_words:
+        return False
+
+    # Get confidence score
+    score = _score_question(text)
+
+    # High confidence = definitely complete
+    if score >= 0.6:
+        return True
+
+    # Medium confidence with good length = probably complete
+    if score >= min_confidence and len(words) >= 8:
+        return True
+
+    # Low confidence but very long might still be complete
+    if score >= 0.2 and len(words) >= 12:
+        return True
+
+    return False
+
+
+def get_question_score(text: str) -> float:
+    """
+    Get the question confidence score for text.
+
+    Exposed wrapper around internal _score_question for external use.
+
+    Args:
+        text: The text to score
+
+    Returns:
+        Confidence score from 0.0 to 1.0
+    """
+    if not text or not text.strip():
+        return 0.0
+    return _score_question(text)
