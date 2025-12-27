@@ -27,7 +27,7 @@ from lib.audio_capture import AudioCapture, list_audio_devices
 from lib.vibe_check import analyze_vibe, get_vibe_summary
 from lib.rag_engine import RAGEngine, format_confidence
 from lib.question_detector import detect_questions, get_primary_question, get_question_score
-from lib.answer_extractor import AnswerExtractor
+from lib.hybrid_answerer import HybridAnswerer
 from lib.question_buffer import QuestionBuffer, BufferConfig
 from lib.dashboard import (
     display_header,
@@ -41,7 +41,7 @@ BASE_DIR = Path(__file__).parent
 MODEL_DIR = BASE_DIR / "models"
 RUNNER_DIR = BASE_DIR / "runners" / "macos-arm64"
 DOCS_DIR = BASE_DIR / "docs"  # Load all PDFs from this directory
-TEXT_MODEL = MODEL_DIR / "LFM2-1.2B-Q4_K_M.gguf"
+RAG_MODEL = MODEL_DIR / "LFM2-1.2B-RAG-Q4_K_M.gguf"  # RAG-specialized model for answer generation
 OUTPUT_FILE = BASE_DIR / "output" / "live_analytics.txt"
 
 
@@ -66,11 +66,13 @@ class MeetingIntelligence:
         self.rag = RAGEngine(DOCS_DIR)
         display_status("RAG engine ready")
 
-        # Answer extractor - extracts answers from context without hallucination
-        # No LLM needed for extraction, just sentence scoring
-        display_status("Initializing answer extractor...")
-        self.answer_extractor = AnswerExtractor()
-        display_status("Answer extractor ready (extraction mode)")
+        # Hybrid answerer - extraction for grounding + LLM for fluency
+        display_status("Loading LFM2-1.2B-RAG model...")
+        self.answerer = HybridAnswerer(
+            model_path=RAG_MODEL,
+            use_generation=True,  # Always use generation by default
+        )
+        display_status("Hybrid answerer ready (extraction + generation)")
 
         self.audio = AudioCapture(device=audio_device)
 
@@ -356,14 +358,15 @@ class MeetingIntelligence:
             print(f"🎧 Listening...")
             return
 
-        # Extract answer from context (no LLM generation = no hallucination)
+        # Generate answer using hybrid pipeline (extraction + LFM2-1.2B-RAG)
         t_start = time_module.time()
-        answer, extraction_confidence = self.answer_extractor.extract(
-            rag_context, cleaned_question, polish=False
+        answer, extraction_confidence, method = self.answerer.answer(
+            question=cleaned_question,
+            rag_context=rag_context,
         )
         t_answer = time_module.time() - t_start
 
-        if answer and not answer.startswith("[I don't"):
+        if answer and not answer.startswith("[I don't") and method != "no_match":
             # Clear screen and show Q&A
             print("\033[2J\033[H")  # Clear screen
             print("━" * 70)
@@ -420,6 +423,10 @@ class MeetingIntelligence:
             print(f"📊 Confidence: [{conf_bar}] {confidence:.0%}")
             print(f"🎭 Vibe: {vibe['emoji']} {vibe['dominant']}")
 
+            # Show which method was used
+            method_label = "LFM2-RAG" if method == "hybrid" else "Extraction"
+            print(f"⚡ Method: {method_label} ({t_answer:.1f}s)")
+
             print("\n" + "━" * 70)
             print("🎧 Listening for next question... (Ctrl+C to stop)")
 
@@ -436,7 +443,7 @@ class MeetingIntelligence:
         """Start real-time processing"""
         display_status(f"Listening to {self.audio.device}...")
         display_status(f"Output file: {OUTPUT_FILE}")
-        print(f"\n📝 Mode: Extraction (answers pulled directly from documents)")
+        print(f"\n📝 Mode: Hybrid (extraction + LFM2-1.2B-RAG generation)")
         print(f"   Press Ctrl+C to stop\n")
 
         self._running = True
@@ -462,7 +469,7 @@ def test_transcription(audio_file: Path):
 
     lfm2 = LFM2Wrapper(MODEL_DIR, RUNNER_DIR)
     rag = RAGEngine(DOCS_DIR)
-    extractor = AnswerExtractor()
+    answerer = HybridAnswerer(RAG_MODEL, use_generation=True)
 
     # Resolve to absolute path
     audio_file = audio_file.resolve()
@@ -479,17 +486,18 @@ def test_transcription(audio_file: Path):
     print(f"📄 Source: {source_file}")
     print(f"📄 Context: {rag.get_context_preview(context, 200)}")
 
-    # Check for questions and extract answers
+    # Check for questions and generate answers
     question_result = get_primary_question(text)
     if question_result:
         question_text, score = question_result
         print(f"\n❓ Question Detected (confidence: {score:.0%}):\n   {question_text}")
 
         if score > 0.3:
-            print("\n💡 EXTRACTED ANSWER:")
-            answer, extraction_conf = extractor.extract(question_text, context)
+            print("\n💡 ANSWER (Hybrid Pipeline):")
+            answer, extraction_conf, method = answerer.answer(question_text, context)
             print(f"   {answer}")
             print(f"\n📄 Source: {source_file}")
+            print(f"⚡ Method: {'LFM2-RAG' if method == 'hybrid' else 'Extraction'}")
     else:
         print("\n❓ No question detected in transcript")
 
@@ -506,8 +514,9 @@ Examples:
   python coach.py --list-devices   # List available audio devices
 
 Answer Mode:
-  Extraction mode - answers are pulled directly from your documents.
-  No LLM generation = no hallucination. Fast and reliable.
+  Hybrid mode - extraction for grounding + LFM2-1.2B-RAG for fluent answers.
+  Stage 1: Extract relevant sentences from documents (grounding)
+  Stage 2: Generate fluent answer with RAG-specialized model
         """,
     )
     parser.add_argument(

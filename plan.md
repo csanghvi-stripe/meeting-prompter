@@ -6,26 +6,26 @@ This document describes the architecture decisions and implementation details fo
 
 ## Design Philosophy
 
-### Core Principle: Extraction Over Generation
+### Core Principle: Hybrid RAG (Extraction + Generation)
 
-Small LLMs (1-3B parameters) are unreliable at following instructions like "only use this context". They frequently:
-- Ignore provided context entirely
-- Hallucinate information not in the source
-- Mix context with training data
-
-**Our solution**: Don't generate answers. Extract them.
+Small LLMs (1-3B parameters) are unreliable at following "only use this context" instructions when given raw retrieved chunks. **Our solution**: Extract first, then generate.
 
 ```
-Traditional RAG:
-  Question → Retriever → Context → LLM → Generated Answer
-                                    ↑
-                              (hallucination risk)
+Traditional RAG (Problematic):
+  Question → Retriever → Raw Context → LLM → Answer
+                                        ↑
+                                  (hallucination risk)
 
-Extraction-Based RAG:
-  Question → Retriever → Context → Sentence Scorer → Extracted Answer
-                                          ↑
-                                    (no hallucination possible)
+Hybrid RAG (Our Approach):
+  Question → Retriever → Sentence Extractor → LFM2-1.2B-RAG → Fluent Answer
+               ↓              ↓                    ↓
+          (ColBERT)     (grounding)         (RAG-specialized)
 ```
+
+**Why this works**:
+- **Extraction stage** filters irrelevant text and provides grounded context
+- **LFM2-1.2B-RAG** is specifically trained on 1M+ RAG samples to follow context
+- **Fallback** to extraction-only if generation fails
 
 ---
 
@@ -53,12 +53,16 @@ Extraction-Based RAG:
                                    │
                                    ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│                          RAG PIPELINE                                │
+│                      HYBRID RAG PIPELINE                             │
 ├─────────────────────────────────────────────────────────────────────┤
 │                                                                      │
-│  Question ──► ColBERT Retriever ──► Answer Extractor ──► Display    │
-│               (semantic search)      (sentence scoring)              │
-│               (top-3 chunks)         (no LLM needed)                 │
+│  Question ──► ColBERT ──► Sentence Extraction ──► LFM2-1.2B-RAG     │
+│               (top-3)     (grounded context)      (fluent answer)   │
+│                                                                      │
+│  Stage 1: RETRIEVAL        Stage 2: GROUNDING     Stage 3: GENERATION│
+│  - Semantic search         - Score sentences      - ChatML format    │
+│  - Multi-chunk combine     - Extract top-3        - RAG-optimized    │
+│  - Section-aware           - Validate relevance   - Synthesize       │
 │                                                                      │
 └─────────────────────────────────────────────────────────────────────┘
 ```
@@ -152,35 +156,57 @@ def _query_colbert(self, text: str) -> Tuple[str, float, str]:
 
 #### 7. Answer Extractor (`lib/answer_extractor.py`)
 
-**Core insight**: We can extract the answer without an LLM.
+Scores sentences for relevance to ensure grounded context for the LLM:
 
 ```python
 def score_sentence(sentence: str, question: str, position: int, total: int) -> float:
     """Score sentence relevance to question."""
     score = 0.0
-
     # 1. Keyword overlap (primary signal)
-    overlap = len(question_words & sentence_words)
-    score += (overlap / len(question_words)) * 0.5
-
     # 2. Definition patterns ("X is...", "X stands for...")
-    if re.search(r'\bstands for\b', sentence):
-        score += 0.2
-
     # 3. Position bonus (earlier = more likely definition)
-    score += (1.0 - position/total) * 0.2
-
     return score
 ```
 
-Process:
-1. Split context into sentences
-2. Score each sentence against question
-3. Take top 3 by score
-4. Re-sort by document position
-5. Format as bullet points
+#### 8. RAG Answer Generator (`lib/rag_generator.py`)
 
-**No LLM = No Hallucination**
+Uses LFM2-1.2B-RAG with ChatML format:
+
+```python
+RAG_PROMPT_TEMPLATE = """<|im_start|>user
+Use the following context to answer the question. Be concise and direct.
+Only use information from the provided context.
+
+CONTEXT:
+{context}
+
+QUESTION: {question}<|im_end|>
+<|im_start|>assistant
+"""
+```
+
+Key settings:
+- `temperature=0` for factual responses
+- `max_tokens=200` for concise answers
+- Model reset before each generation to prevent KV cache issues
+
+#### 9. Hybrid Answerer (`lib/hybrid_answerer.py`)
+
+Orchestrates the two-stage pipeline:
+
+```python
+def answer(self, question: str, rag_context: str) -> Tuple[str, float, str]:
+    # Stage 1: Extract grounded context
+    extracted, confidence = extract_answer(rag_context, question)
+
+    # Stage 2: Generate fluent answer
+    if self.use_generation:
+        answer = self.generator.generate(question, extracted)
+        return (answer, confidence, "hybrid")
+
+    # Fallback: Return extracted bullets
+    return (format_as_bullets(extracted), confidence, "extraction")
+```
 
 ---
 
@@ -188,7 +214,8 @@ Process:
 
 | Issue | Before | After |
 |-------|--------|-------|
-| LLM ignores context | Generated irrelevant answers | Extracts from context directly |
+| Choppy answers | Bullet points only | Fluent LLM-generated answers |
+| LLM ignores context | Generated irrelevant answers | Extraction-grounded generation |
 | Wrong section retrieved | Random chunks near answer | Section-aware chunking with headers |
 | Single result misses info | One best match | Top-3 combined for richer context |
 | Audio hallucinations | Processed as questions | Pattern-filtered before detection |
@@ -225,7 +252,15 @@ MIN_TOKENS = 30           # Minimum tokens to keep chunk
 ### Answer Extraction
 ```python
 MAX_SENTENCES = 3         # Maximum sentences to extract
-MIN_CONFIDENCE = 0.2      # Minimum score to return answer
+MIN_CONFIDENCE = 0.25     # Minimum score to proceed to generation
+```
+
+### RAG Generation
+```python
+MODEL = "LFM2-1.2B-RAG-Q4_K_M.gguf"  # Q4_K_M quantization (700MB)
+N_CTX = 2048              # Context window size
+MAX_TOKENS = 200          # Maximum tokens in response
+TEMPERATURE = 0           # Greedy decoding for factual answers
 ```
 
 ---
@@ -239,7 +274,9 @@ MIN_CONFIDENCE = 0.2      # Minimum score to return answer
 | `lib/lfm2_wrapper.py` | LFM2-Audio subprocess management |
 | `lib/question_buffer.py` | Time-based speech buffering |
 | `lib/question_detector.py` | Question pattern matching |
-| `lib/answer_extractor.py` | Sentence extraction (no LLM) |
+| `lib/answer_extractor.py` | Sentence extraction for grounding |
+| `lib/rag_generator.py` | LFM2-1.2B-RAG answer generation |
+| `lib/hybrid_answerer.py` | Two-stage pipeline (extraction → generation) |
 | `lib/rag_engine.py` | RAG orchestration (ColBERT + fallback) |
 | `lib/colbert/retriever.py` | ColBERT model + PLAID index |
 | `lib/colbert/chunker.py` | Section-aware document chunking |
@@ -267,6 +304,7 @@ python coach.py --mic
 
 1. **Streaming transcription**: Process audio in real-time instead of 4s chunks
 2. **Multi-document citations**: Show which document each sentence came from
-3. **Confidence calibration**: Better threshold tuning for extraction confidence
+3. **Confidence calibration**: Better threshold tuning for extraction/generation confidence
 4. **Query expansion**: Use question keywords to improve retrieval
 5. **Caching**: Cache frequent question-answer pairs
+6. **Answer validation**: Cross-check generated answer against extracted context

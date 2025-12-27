@@ -1,6 +1,6 @@
 # Meeting Intelligence CLI
 
-A real-time meeting assistant that listens to audio, transcribes speech, and answers questions using your documentation. Everything runs locally on your Mac using [LFM2-Audio](https://huggingface.co/LiquidAI/LFM2-Audio-1.5B-GGUF) for transcription and extraction-based RAG for answers.
+A real-time meeting assistant that listens to audio, transcribes speech, and answers questions using your documentation. Everything runs locally on your Mac using [LFM2-Audio](https://huggingface.co/LiquidAI/LFM2-Audio-1.5B-GGUF) for transcription and [LFM2-1.2B-RAG](https://huggingface.co/LiquidAI/LFM2-1.2B-RAG) for answer generation.
 
 ![Python](https://img.shields.io/badge/python-3.10+-blue)
 ![Platform](https://img.shields.io/badge/platform-macOS%20(Apple%20Silicon)-lightgrey)
@@ -26,7 +26,7 @@ Speak a question like *"How does Liquid AI handle edge deployment?"* and watch i
 
 ## Architecture
 
-The system uses extraction-based RAG with ColBERT semantic search:
+The system uses a **hybrid RAG pipeline**: extraction for grounding + LFM2-1.2B-RAG for fluent answers.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -38,24 +38,27 @@ The system uses extraction-based RAG with ColBERT semantic search:
                                      │
                                      ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│                      RAG Pipeline (Extraction-Based)                 │
+│                      Hybrid RAG Pipeline                             │
 │                                                                      │
-│  Question → ColBERT Retriever → Answer Extractor → Terminal UI      │
-│              (semantic search)   (sentence scoring)                  │
-│              (top-3 chunks)      (no LLM generation)                 │
+│  Question ──► ColBERT ──► Sentence Extraction ──► LFM2-1.2B-RAG     │
+│               (top-3)     (grounded context)      (fluent answer)   │
+│                                                                      │
+│  Stage 1: RETRIEVAL        Stage 2: GROUNDING     Stage 3: GENERATION│
+│  - Semantic search         - Score sentences      - ChatML format    │
+│  - Multi-chunk combine     - Extract top-3        - RAG-optimized    │
+│  - Section-aware           - Validate relevance   - Synthesize       │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-### Why Extraction Over Generation?
+### Why This Hybrid Approach?
 
-Small LLMs (1-3B parameters) are unreliable at following "only use this context" instructions. They often hallucinate or ignore the provided context. Our solution:
+| Approach | Pros | Cons |
+|----------|------|------|
+| **Extraction Only** | Fast, no hallucination | Choppy, no synthesis |
+| **Generation Only** | Fluent answers | Hallucination risk |
+| **Hybrid** (our approach) | Best of both | Slightly slower (~500ms) |
 
-| Approach | Problem | Our Solution |
-|----------|---------|--------------|
-| LLM Generation | Ignores context, hallucinates | **Sentence Extraction** - pull directly from docs |
-| Single embedding | Loses semantic nuance | **ColBERT MaxSim** - token-level matching |
-| Random chunk splits | Loses document structure | **Section-aware chunking** - split on ## headers |
-| Single result | May miss relevant context | **Multi-chunk retrieval** - combine top-3 results |
+**LFM2-1.2B-RAG** is ideal because it's trained on 1M+ multi-turn, multi-document RAG samples. The extraction stage ensures grounding while the generation stage produces natural, conversational responses.
 
 ### Components
 
@@ -67,18 +70,19 @@ Small LLMs (1-3B parameters) are unreliable at following "only use this context"
 | **Question Detection** | Regex + scoring | Identifies questions by structure, keywords, and confidence |
 | **Question Buffer** | Time-based | Buffers speech chunks, flushes on 1.5s pause |
 | **RAG Search** | LFM2-ColBERT-350M | Section-aware semantic search, returns top-3 chunks (~100ms) |
-| **Answer Extraction** | Sentence scoring | Extracts relevant sentences from context (no LLM) |
+| **Answer Extraction** | Sentence scoring | Extracts relevant sentences for grounding |
+| **Answer Generation** | LFM2-1.2B-RAG | Generates fluent answers from grounded context (~500ms) |
 | **Vibe Check** | Keyword scoring | Detects emotional tone (Excited/Frustrated/etc.) |
 
-### Why Two Models Instead of Three?
+### Why Three Models?
 
 - **LFM2-Audio-1.5B** is a multimodal model that directly processes audio waveforms. It runs as a subprocess via the `llama-lfm2-audio` binary.
 
 - **LFM2-ColBERT-350M** provides semantic document retrieval. Unlike keyword search, it understands that "neural network alternatives" should match content about "LFM architecture" even without exact word overlap.
 
-- **Answer Extraction** replaces LLM generation. Instead of asking a small LLM to "answer using only this context" (which they're bad at), we score and extract sentences directly from the retrieved context. This structurally prevents hallucination.
+- **LFM2-1.2B-RAG** is specialized for RAG tasks - trained on 1M+ multi-document QA samples. It generates fluent answers while respecting the provided context. The extraction stage ensures grounding before generation.
 
-This separation keeps each component focused on what it does best - and avoids the hallucination problems of small generative models.
+This separation keeps each component focused on what it does best.
 
 ---
 
@@ -209,6 +213,7 @@ python coach.py --list-devices
 | [LFM2-Audio-1.5B-Q8_0.gguf](https://huggingface.co/LiquidAI/LFM2-Audio-1.5B-GGUF) | 1.2 GB | Speech-to-text |
 | mmproj-audioencoder-LFM2-Audio-1.5B-Q8_0.gguf | 317 MB | Audio encoder |
 | audiodecoder-LFM2-Audio-1.5B-Q8_0.gguf | 358 MB | Audio decoder |
+| [LFM2-1.2B-RAG-Q4_K_M.gguf](https://huggingface.co/LiquidAI/LFM2-1.2B-RAG-GGUF) | 700 MB | RAG answer generation |
 
 Also download the llama.cpp runner from [LFM2-Audio runners](https://huggingface.co/LiquidAI/LFM2-Audio-1.5B-GGUF/tree/main/runners) → `runners/macos-arm64/`
 
@@ -219,8 +224,6 @@ Also download the llama.cpp runner from [LFM2-Audio runners](https://huggingface
 | [LFM2-ColBERT-350M](https://huggingface.co/LiquidAI/LFM2-ColBERT-350M) | 1.4 GB | Semantic document retrieval |
 
 ColBERT is downloaded automatically on first run via the `pylate` library. The PLAID index is built once and cached in `data/colbert_index/`.
-
-**Note**: LFM2-1.2B text model is no longer required. Answers are extracted directly from retrieved context without LLM generation.
 
 ## Live Meeting Setup (BlackHole)
 
@@ -279,8 +282,9 @@ meeting-intelligence-cli/
 │   ├── audio_capture.py      # Streaming audio capture (with level detection)
 │   ├── question_detector.py  # Question pattern matching + scoring
 │   ├── question_buffer.py    # Time-based question buffering
-│   ├── answer_extractor.py   # Sentence extraction (no LLM)
-│   ├── answer_generator.py   # LLM generation (legacy, unused)
+│   ├── answer_extractor.py   # Sentence extraction for grounding
+│   ├── rag_generator.py      # LFM2-1.2B-RAG answer generation
+│   ├── hybrid_answerer.py    # Two-stage pipeline (extraction → generation)
 │   ├── rag_engine.py         # Document search (ColBERT + fallback)
 │   ├── vibe_check.py         # Tone detection
 │   └── colbert/              # Semantic retrieval module
@@ -300,7 +304,7 @@ meeting-intelligence-cli/
 ## Requirements
 
 - macOS with Apple Silicon (M1/M2/M3/M4)
-- 8GB+ RAM (ColBERT ~1.5GB + LFM2-Audio ~2GB = ~3.5GB total)
+- 16GB+ RAM (ColBERT ~1.5GB + LFM2-Audio ~2GB + LFM2-RAG ~1GB = ~4.5GB total)
 - Python 3.10+
 
 ## Troubleshooting
